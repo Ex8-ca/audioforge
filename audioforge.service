@@ -1,0 +1,14 @@
+[Unit]
+Description=audioforge — AI Music Generator
+After=network.target
+
+[Service]
+Type=simple
+User=marc
+WorkingDirectory=/home/marc/music-generator
+ExecStart=/usr/bin/python3 /home/marc/music-generator/server.py 8989
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

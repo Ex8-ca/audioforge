@@ -1,0 +1,828 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>audioforge — AI Music Generator</title>
+<script src="https://cdn.tailwindcss.com?plugins=forms,typography"></script>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/icon?family=Material+Icons+Outlined" rel="stylesheet"/>
+<script>
+tailwind.config = {
+    darkMode: "class",
+    theme: {
+        extend: {
+            colors: {
+                primary: "#f43f5e",
+                "primary-hover": "#e11d48",
+                "primary-glow": "rgba(244,63,94,0.3)",
+                surface: "#111827",
+                "surface-2": "#1f2937",
+                "surface-3": "#374151",
+                border: "#4b5563",
+                accent: "#8b5cf6",
+            },
+            fontFamily: { sans: ["Inter", "sans-serif"] },
+        },
+    },
+};
+</script>
+<style>
+    body { font-family: 'Inter', sans-serif; }
+    .scrollbar-thin::-webkit-scrollbar { width: 5px; height: 5px; }
+    .scrollbar-thin::-webkit-scrollbar-track { background: transparent; }
+    .scrollbar-thin::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 3px; }
+    .style-tag { transition: all 0.15s; }
+    .style-tag:hover { transform: translateY(-1px); }
+    .style-tag.active { background: #f43f5e; color: white; border-color: #f43f5e; }
+    .track-row { transition: background 0.15s; }
+    .track-row:hover { background: rgba(255,255,255,0.05); }
+    .track-row.playing { background: rgba(244,63,94,0.08); border-left: 3px solid #f43f5e; }
+    @keyframes pulse-ring {
+        0%, 100% { box-shadow: 0 0 0 0 rgba(244,63,94,0.4); }
+        50% { box-shadow: 0 0 0 8px rgba(244,63,94,0); }
+    }
+    .playing-indicator { animation: pulse-ring 1.5s ease-in-out infinite; }
+    .waveform-bar { animation: wave 0.8s ease-in-out infinite; }
+    @keyframes wave {
+        0%, 100% { transform: scaleY(0.3); }
+        50% { transform: scaleY(1); }
+    }
+    .gen-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    input[type="range"]::-webkit-slider-thumb { background: #f43f5e; }
+</style>
+</head>
+<body class="bg-gray-950 text-gray-100 min-h-screen">
+
+<!-- Header -->
+<header class="border-b border-gray-800 px-6 py-3">
+    <div class="flex items-center justify-between max-w-7xl mx-auto">
+        <div class="flex items-center gap-3">
+            <div class="w-9 h-9 rounded-lg bg-primary flex items-center justify-center">
+                <span class="material-icons-outlined text-white text-xl">music_note</span>
+            </div>
+            <div>
+                <h1 class="text-lg font-bold text-white">audioforge</h1>
+                <p class="text-xs text-gray-500">AI Music Generator</p>
+            </div>
+        </div>
+        <div class="flex items-center gap-3">
+            <select id="modelSelect"
+                class="bg-surface-2 border border-gray-700 rounded-lg px-3 py-1.5 text-sm text-gray-200 focus:outline-none focus:border-primary">
+                <option value="music-2.6">music-2.6 (Recommended)</option>
+                <option value="music-2.6-free">music-2.6-free</option>
+            </select>
+        </div>
+    </div>
+</header>
+
+<!-- Main Layout -->
+<main class="max-w-7xl mx-auto px-6 py-5 flex gap-5" style="min-height: calc(100vh - 120px);">
+
+    <!-- Left Panel: Creation (flex column, scrollable area + fixed bottom actions) -->
+    <div class="w-[440px] flex-shrink-0 flex flex-col gap-3" style="height: calc(100vh - 160px);">
+
+        <!-- Scrollable Sections -->
+        <div class="flex-1 overflow-y-auto scrollbar-thin space-y-3 pr-1">
+
+            <!-- Lyrics Section -->
+            <div class="bg-surface rounded-xl border border-gray-800 overflow-hidden">
+                <div class="flex items-center justify-between px-4 py-2.5 border-b border-gray-800">
+                    <h2 class="text-sm font-semibold text-gray-300 uppercase tracking-wide flex items-center gap-2">
+                        <span class="material-icons-outlined text-sm text-primary">lyrics</span>
+                        Lyrics
+                    </h2>
+                    <div class="flex items-center gap-2">
+                        <label class="flex items-center gap-1.5 text-xs text-gray-400 cursor-pointer">
+                            <input type="checkbox" id="autoLyricsToggle" class="rounded bg-surface-3 border-gray-600 text-primary focus:ring-primary" onchange="onAutoLyricsChange()">
+                            Auto-gen
+                        </label>
+                        <button onclick="generateLyrics()" class="text-xs text-accent hover:text-violet-300 flex items-center gap-0.5" title="Generate lyrics from theme">
+                            <span class="material-icons-outlined text-sm">auto_fix_high</span>
+                            Generate
+                        </button>
+                        <button onclick="insertLyricsStructure()" class="text-xs text-gray-400 hover:text-gray-300 flex items-center gap-0.5" title="Insert song structure">
+                            <span class="material-icons-outlined text-sm">note_add</span>
+                        </button>
+                    </div>
+                </div>
+                <div class="p-3">
+                    <textarea id="lyricsInput" rows="8" placeholder="Write lyrics here... or leave blank for instrumental&#10;&#10;Tip: Use tags like [verse], [chorus], [bridge], [intro], [outro]"
+                        class="w-full bg-surface-2 border border-gray-700 rounded-lg px-3 py-2.5 text-sm text-gray-200 placeholder-gray-600 focus:outline-none focus:border-primary resize-none font-mono leading-relaxed" style="max-height: 200px;"></textarea>
+                </div>
+            </div>
+
+            <!-- Style Section -->
+            <div class="bg-surface rounded-xl border border-gray-800 overflow-hidden">
+                <div class="flex items-center justify-between px-4 py-2.5 border-b border-gray-800">
+                    <h2 class="text-sm font-semibold text-gray-300 uppercase tracking-wide flex items-center gap-2">
+                        <span class="material-icons-outlined text-sm text-primary">palette</span>
+                        Style
+                    </h2>
+                    <button onclick="randomizeStyle()" class="text-xs text-gray-400 hover:text-gray-300 flex items-center gap-0.5" title="Randomize style">
+                        <span class="material-icons-outlined text-sm">casino</span>
+                    </button>
+                </div>
+                <div class="p-3 space-y-3">
+                    <textarea id="styleInput" rows="2" placeholder="Describe the style: genre, mood, tempo, instruments, vocals..."
+                        class="w-full bg-surface-2 border border-gray-700 rounded-lg px-3 py-2.5 text-sm text-gray-200 placeholder-gray-600 focus:outline-none focus:border-primary resize-none"></textarea>
+                    <div class="flex flex-wrap gap-1.5 max-h-[160px] overflow-y-auto scrollbar-thin" id="styleTags">
+                        <!-- Populated by JS -->
+                    </div>
+                </div>
+            </div>
+
+            <!-- Quick Presets -->
+            <div class="bg-surface rounded-xl border border-gray-800 p-3">
+                <h2 class="text-sm font-semibold text-gray-300 uppercase tracking-wide mb-2">Quick Presets</h2>
+                <div class="grid grid-cols-2 gap-1.5" id="presetGrid" style="grid-template-columns: repeat(2, minmax(0, 1fr));">
+                    <!-- Populated by JS -->
+                </div>
+            </div>
+
+            <!-- More Options -->
+            <div class="bg-surface rounded-xl border border-gray-800 overflow-hidden">
+                <button onclick="toggleMoreOptions()" class="w-full flex items-center justify-between px-4 py-2.5">
+                    <h2 class="text-sm font-semibold text-gray-300 uppercase tracking-wide flex items-center gap-2">
+                        <span class="material-icons-outlined text-sm text-primary">tune</span>
+                        More Options
+                    </h2>
+                    <span id="moreOptionsArrow" class="material-icons-outlined text-gray-400 transition-transform">expand_more</span>
+                </button>
+                <div id="moreOptionsPanel" class="hidden px-4 pb-3 space-y-3">
+                    <!-- Vocal Gender -->
+                    <div class="flex items-center justify-between">
+                        <label class="text-xs text-gray-400 flex items-center gap-1">
+                            Vocal Gender
+                            <span class="material-icons-outlined text-xs cursor-help text-gray-600" title="Preferred vocal gender">help_outline</span>
+                        </label>
+                        <div class="flex bg-surface-2 rounded-lg border border-gray-700 overflow-hidden">
+                            <button onclick="setVocalGender('')" id="genderNone" class="px-3 py-1 text-xs font-medium text-primary bg-primary/10 border-r border-gray-700">Any</button>
+                            <button onclick="setVocalGender('Male Vocals')" id="genderMale" class="px-3 py-1 text-xs font-medium text-gray-400 border-r border-gray-700">Male</button>
+                            <button onclick="setVocalGender('Female Vocals')" id="genderFemale" class="px-3 py-1 text-xs font-medium text-gray-400">Female</button>
+                        </div>
+                    </div>
+                    <!-- Instrumental -->
+                    <div class="flex items-center justify-between">
+                        <label class="text-xs text-gray-400 flex items-center gap-1">
+                            Instrumental Only
+                            <span class="material-icons-outlined text-xs cursor-help text-gray-600" title="Generate without vocals">help_outline</span>
+                        </label>
+                        <label class="relative inline-flex items-center cursor-pointer">
+                            <input type="checkbox" id="instrumentalToggle" class="sr-only peer" onchange="onInstrumentalChange()">
+                            <div class="w-9 h-5 bg-surface-3 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-primary"></div>
+                        </label>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Song Title -->
+            <div class="bg-surface rounded-xl border border-gray-800 p-3">
+                <div class="flex items-center gap-2">
+                    <span class="material-icons-outlined text-gray-500 text-sm">title</span>
+                    <input type="text" id="songTitle" placeholder="Song Title (Optional)"
+                        class="flex-1 bg-transparent text-sm text-gray-200 placeholder-gray-600 focus:outline-none">
+                </div>
+            </div>
+        </div>
+
+        <!-- Fixed Bottom: Create Button + Progress -->
+        <div class="space-y-3 flex-shrink-0">
+            <button onclick="generate()" id="generateBtn" class="gen-btn w-full bg-primary hover:bg-primary-hover text-white font-bold py-3.5 rounded-xl flex items-center justify-center gap-2 transition-all active:scale-[0.98] shadow-lg shadow-primary/20 text-base text-center">
+                <span class="material-icons-outlined flex-shrink-0">music_note</span>
+                <span id="btnText">Create</span>
+            </button>
+            <div id="progressPanel" class="hidden bg-surface rounded-xl border border-gray-800 p-3">
+                <div class="flex items-center gap-3">
+                    <div class="flex gap-0.5">
+                        <div class="waveform-bar w-1 h-4 bg-primary rounded-full" style="animation-delay: 0s"></div>
+                        <div class="waveform-bar w-1 h-4 bg-primary rounded-full" style="animation-delay: 0.1s"></div>
+                        <div class="waveform-bar w-1 h-4 bg-primary rounded-full" style="animation-delay: 0.2s"></div>
+                        <div class="waveform-bar w-1 h-4 bg-primary rounded-full" style="animation-delay: 0.3s"></div>
+                        <div class="waveform-bar w-1 h-4 bg-primary rounded-full" style="animation-delay: 0.4s"></div>
+                    </div>
+                    <div class="flex-1 min-w-0">
+                        <p class="text-sm text-gray-300 truncate" id="progressText">Generating...</p>
+                        <p class="text-xs text-gray-500" id="progressSubtext">This may take 1-3 minutes</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Right Panel: Track List -->
+    <div class="flex-1 min-w-0">
+        <div class="bg-surface rounded-xl border border-gray-800 overflow-hidden h-full flex flex-col" style="height: calc(100vh - 160px);">
+            <div class="flex items-center justify-between px-5 py-3 border-b border-gray-800 flex-shrink-0">
+                <h2 class="text-sm font-semibold text-gray-300 uppercase tracking-wide">My Tracks</h2>
+                <button onclick="loadTracks()" class="text-xs text-gray-500 hover:text-gray-400 flex items-center gap-1">
+                    <span class="material-icons-outlined text-xs">refresh</span>
+                    Refresh
+                </button>
+            </div>
+            <div id="trackList" class="flex-1 overflow-y-auto scrollbar-thin p-2">
+                <div class="text-center py-16">
+                    <span class="material-icons-outlined text-5xl text-gray-700">library_music</span>
+                    <p class="text-gray-600 mt-3 text-sm">No tracks yet</p>
+                    <p class="text-gray-700 text-xs mt-1">Your generated music will appear here</p>
+                </div>
+            </div>
+        </div>
+    </div>
+</main>
+
+<!-- Bottom Player Bar -->
+<div id="playerBar" class="hidden fixed bottom-0 left-0 right-0 bg-surface border-t border-gray-800 px-6 py-3 z-50">
+    <div class="max-w-7xl mx-auto flex items-center gap-4">
+        <div class="w-64 flex items-center gap-3 flex-shrink-0">
+            <div class="w-12 h-12 rounded-lg bg-surface-2 flex items-center justify-center flex-shrink-0">
+                <span class="material-icons-outlined text-primary text-2xl">music_note</span>
+            </div>
+            <div class="min-w-0">
+                <p class="text-sm font-medium text-white truncate" id="playerTitle">—</p>
+                <p class="text-xs text-gray-500 truncate" id="playerStyle">—</p>
+            </div>
+        </div>
+        <div class="flex-1 flex flex-col items-center gap-1">
+            <div class="flex items-center gap-4">
+                <button class="text-gray-400 hover:text-white" title="Shuffle" onclick="toggleShuffle()">
+                    <span class="material-icons-outlined text-sm">shuffle</span>
+                </button>
+                <button class="text-gray-400 hover:text-white" title="Previous" onclick="prevTrack()">
+                    <span class="material-icons-outlined">skip_previous</span>
+                </button>
+                <button onclick="togglePlay()" id="playBtn" class="w-10 h-10 rounded-full bg-white text-gray-900 flex items-center justify-center hover:scale-105 transition-transform">
+                    <span class="material-icons-outlined text-xl" id="playIcon">play_arrow</span>
+                </button>
+                <button class="text-gray-400 hover:text-white" title="Next" onclick="nextTrack()">
+                    <span class="material-icons-outlined">skip_next</span>
+                </button>
+                <button class="text-gray-400 hover:text-white" title="Repeat" onclick="toggleRepeat()">
+                    <span class="material-icons-outlined text-sm">repeat</span>
+                </button>
+            </div>
+            <div class="w-full flex items-center gap-2">
+                <span class="text-xs text-gray-500 w-10 text-right" id="currentTime">0:00</span>
+                <input type="range" id="progressSlider" min="0" max="100" value="0"
+                    oninput="seekTrack(this.value)"
+                    class="flex-1 h-1 bg-surface-3 rounded-full appearance-none cursor-pointer accent-primary">
+                <span class="text-xs text-gray-500 w-10" id="totalTime">0:00</span>
+            </div>
+        </div>
+        <div class="w-32 flex items-center gap-2 flex-shrink-0">
+            <button onclick="toggleMute()" class="text-gray-400 hover:text-white">
+                <span class="material-icons-outlined text-sm" id="volumeIcon">volume_up</span>
+            </button>
+            <input type="range" id="volumeSlider" min="0" max="100" value="80"
+                oninput="setVolume(this.value)"
+                class="flex-1 h-1 bg-surface-3 rounded-full appearance-none cursor-pointer accent-primary">
+        </div>
+    </div>
+</div>
+
+<audio id="audioPlayer" preload="none"></audio>
+
+<script>
+// ============================================================
+// Config
+// ============================================================
+const STYLE_TAGS = [
+    'pop', 'rock', 'hip hop', 'jazz', 'blues', 'electronic', 'classical', 'country',
+    'r&b', 'indie', 'metal', 'folk', 'ambient', 'lo-fi', 'synthwave', 'reggae',
+    'punk', 'soul', 'funk', 'disco', 'trap', 'drum and bass', 'techno', 'house',
+    'acoustic', 'piano', 'guitar', 'orchestral', 'cinematic', 'chill', 'upbeat',
+    'melancholic', 'energetic', 'dreamy', 'dark', 'happy', 'romantic', 'epic',
+    'male vocals', 'female vocals', 'instrumental', 'slow tempo', 'fast tempo',
+    '60 bpm', '80 bpm', '100 bpm', '120 bpm', '140 bpm'
+];
+
+const PRESETS = [
+    { name: 'Soulful Blues', prompt: 'Soulful Blues, Rainy Night, Melancholy, Electric Guitar, Slow Tempo', icon: 'cloudy_snowing' },
+    { name: 'Upbeat Pop', prompt: 'Upbeat Pop, Catchy Hook, Dance, Female Vocals, 120 BPM, Bright', icon: 'emoji_objects' },
+    { name: 'Lo-Fi Chill', prompt: 'Lo-Fi Hip Hop, Chill, Study Beats, Vinyl Crackle, Relaxed, Jazz Chords', icon: 'headphones' },
+    { name: 'Epic Cinematic', prompt: 'Epic Cinematic, Orchestral, Drums, Choir, Building Tension, Heroic', icon: 'movie' },
+    { name: 'Acoustic Folk', prompt: 'Acoustic Folk, Warm Guitar, Gentle Vocals, Nature, Peaceful, Campfire', icon: 'park' },
+    { name: 'Synthwave', prompt: 'Synthwave, Retro 80s, Neon, Driving Bass, Arpeggiated Synths, Night Drive', icon: 'nightlife' },
+    { name: 'Jazz Club', prompt: 'Jazz Club, Smooth Saxophone, Upright Bass, Brushed Drums, Late Night, Intimate', icon: 'wine_bar' },
+    { name: 'Heavy Metal', prompt: 'Heavy Metal, Distorted Guitars, Double Kick Drums, Aggressive, Power, Shredding', icon: 'headset' },
+];
+
+// State
+let tracks = [];
+let currentTrackIndex = -1;
+let isPlaying = false;
+let vocalGender = '';
+const audio = document.getElementById('audioPlayer');
+
+// ============================================================
+// Init
+// ============================================================
+window.addEventListener('DOMContentLoaded', () => {
+    renderStyleTags();
+    renderPresets();
+    loadTracks();
+    setupAudioEvents();
+});
+
+function renderStyleTags() {
+    const container = document.getElementById('styleTags');
+    const shuffled = [...STYLE_TAGS].sort(() => Math.random() - 0.5).slice(0, 20);
+    container.innerHTML = shuffled.map(tag => `
+        <button onclick="toggleStyleTag(this, '${tag}')"
+            class="style-tag px-2.5 py-1 text-xs rounded-full border border-gray-700 bg-surface-2 text-gray-400 hover:border-gray-500 hover:text-gray-200 whitespace-nowrap">
+            ${tag}
+        </button>
+    `).join('');
+}
+
+function renderPresets() {
+    const grid = document.getElementById('presetGrid');
+    grid.innerHTML = PRESETS.map(p => `
+        <button onclick="applyPreset('${p.prompt}')"
+            class="flex items-center gap-2 px-2.5 py-2 rounded-lg bg-surface-2 border border-gray-700 hover:border-primary/50 hover:bg-primary/5 transition-all text-left min-w-0">
+            <span class="material-icons-outlined text-primary text-sm flex-shrink-0">${p.icon}</span>
+            <span class="text-xs text-gray-300 font-medium truncate leading-tight">${p.name}</span>
+        </button>
+    `).join('');
+}
+
+// ============================================================
+// Style & Tags
+// ============================================================
+function toggleStyleTag(el, tag) {
+    el.classList.toggle('active');
+    const styleInput = document.getElementById('styleInput');
+    const current = styleInput.value.trim();
+    const tags = current ? current.split(',').map(t => t.trim()) : [];
+
+    if (el.classList.contains('active')) {
+        if (!tags.includes(tag)) tags.push(tag);
+    } else {
+        const idx = tags.indexOf(tag);
+        if (idx > -1) tags.splice(idx, 1);
+    }
+    styleInput.value = tags.join(', ');
+}
+
+function applyPreset(prompt) {
+    document.getElementById('styleInput').value = prompt;
+    document.querySelectorAll('.style-tag.active').forEach(el => el.classList.remove('active'));
+}
+
+function randomizeStyle() {
+    const randomTags = [...STYLE_TAGS].sort(() => Math.random() - 0.5).slice(0, 4);
+    document.getElementById('styleInput').value = randomTags.join(', ');
+    document.querySelectorAll('.style-tag').forEach(el => {
+        el.classList.toggle('active', randomTags.includes(el.textContent.trim()));
+    });
+}
+
+// ============================================================
+// Lyrics
+// ============================================================
+function insertLyricsStructure() {
+    const textarea = document.getElementById('lyricsInput');
+    const template = `[intro]
+(Instrumental)
+
+[verse 1]
+(Write your lyrics here)
+
+[chorus]
+(Write your chorus here)
+
+[verse 2]
+(Write your second verse here)
+
+[chorus]
+(Repeat chorus)
+
+[bridge]
+(Write your bridge here)
+
+[outro]
+(Fade out)`;
+
+    if (!textarea.value.trim()) {
+        textarea.value = template;
+    } else {
+        textarea.value += '\n\n' + template;
+    }
+}
+
+async function generateLyrics() {
+    const style = document.getElementById('styleInput').value.trim();
+    const prompt = style || 'a song about life and dreams';
+
+    const btn = event.target.closest('button');
+    const origHTML = btn.innerHTML;
+    btn.innerHTML = '<span class="material-icons-outlined text-sm animate-spin">progress_activity</span>';
+    btn.disabled = true;
+
+    try {
+        const resp = await fetch('/music/lyrics', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ prompt: `Write lyrics for: ${prompt}`, mode: 'write_full_song' })
+        });
+
+        if (!resp.ok) {
+            const err = await resp.json();
+            throw new Error(err.error || 'Failed');
+        }
+
+        const data = await resp.json();
+        if (data.lyrics) {
+            document.getElementById('lyricsInput').value = data.lyrics;
+        } else {
+            alert('No lyrics returned — try a more specific prompt.');
+        }
+    } catch(e) {
+        console.error('Lyrics error:', e);
+        alert('Could not generate lyrics: ' + e.message);
+    } finally {
+        btn.innerHTML = origHTML;
+        btn.disabled = false;
+    }
+}
+
+function onAutoLyricsChange() {
+    const checked = document.getElementById('autoLyricsToggle').checked;
+    const lyricsInput = document.getElementById('lyricsInput');
+    lyricsInput.disabled = checked;
+    if (checked) lyricsInput.value = '';
+}
+
+// ============================================================
+// More Options
+// ============================================================
+function toggleMoreOptions() {
+    const panel = document.getElementById('moreOptionsPanel');
+    const arrow = document.getElementById('moreOptionsArrow');
+    panel.classList.toggle('hidden');
+    arrow.style.transform = panel.classList.contains('hidden') ? '' : 'rotate(180deg)';
+}
+
+function setVocalGender(gender) {
+    vocalGender = gender;
+    ['None', 'Male', 'Female'].forEach((label, i) => {
+        const btn = document.getElementById(`gender${label}`);
+        const isActive = (i === 0 && !gender) || (i === 1 && gender === 'Male Vocals') || (i === 2 && gender === 'Female Vocals');
+        btn.className = `px-3 py-1 text-xs font-medium ${isActive ? 'text-primary bg-primary/10' : 'text-gray-400'} ${i < 2 ? 'border-r border-gray-700' : ''}`;
+    });
+}
+
+function onInstrumentalChange() {
+    const isInstrumental = document.getElementById('instrumentalToggle').checked;
+    const lyricsInput = document.getElementById('lyricsInput');
+    const autoLyrics = document.getElementById('autoLyricsToggle');
+
+    if (isInstrumental) {
+        lyricsInput.disabled = true;
+        autoLyrics.disabled = true;
+        autoLyrics.checked = false;
+    } else {
+        lyricsInput.disabled = false;
+        autoLyrics.disabled = false;
+    }
+}
+
+// ============================================================
+// Generation
+// ============================================================
+async function generate() {
+    const style = document.getElementById('styleInput').value.trim();
+    if (!style) {
+        alert('Please enter a style description');
+        return;
+    }
+
+    const lyrics = document.getElementById('lyricsInput').value.trim();
+    const isInstrumental = document.getElementById('instrumentalToggle').checked;
+    const autoLyrics = document.getElementById('autoLyricsToggle').checked;
+    const model = document.getElementById('modelSelect').value;
+    const title = document.getElementById('songTitle').value.trim() || `Track ${Date.now()}`;
+
+    let fullPrompt = style;
+    if (vocalGender && !style.toLowerCase().includes('vocal')) {
+        fullPrompt += ', ' + vocalGender;
+    }
+
+    const btn = document.getElementById('generateBtn');
+    const btnText = document.getElementById('btnText');
+    btn.disabled = true;
+    btnText.textContent = 'Creating...';
+
+    document.getElementById('progressPanel').classList.remove('hidden');
+    document.getElementById('progressText').textContent = 'Composing...';
+    document.getElementById('progressSubtext').textContent = 'This may take 1-3 minutes';
+
+    const startTime = Date.now();
+    const timer = setInterval(() => {
+        const elapsed = Math.floor((Date.now() - startTime) / 1000);
+        document.getElementById('progressSubtext').textContent = `${elapsed}s elapsed — still composing...`;
+    }, 1000);
+
+    try {
+        const resp = await fetch('/music/generate', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                prompt: fullPrompt,
+                lyrics: isInstrumental ? '' : lyrics,
+                model: model,
+                is_instrumental: isInstrumental,
+                auto_generate_lyrics: autoLyrics && !lyrics,
+            })
+        });
+
+        if (!resp.ok) {
+            let errMsg = 'Generation failed';
+            try {
+                const err = await resp.json();
+                errMsg = err.error || errMsg;
+            } catch(e) {}
+            throw new Error(errMsg);
+        }
+
+        const duration = resp.headers.get('X-Duration') || '0';
+        const blob = await resp.blob();
+        const audioUrl = URL.createObjectURL(blob);
+
+        const track = {
+            id: Date.now(),
+            title: title,
+            prompt: fullPrompt,
+            model: model,
+            duration: parseInt(duration) / 1000,
+            url: audioUrl,
+            blob: blob,
+            createdAt: new Date().toLocaleString(),
+            isInstrumental: isInstrumental,
+        };
+
+        tracks.unshift(track);
+        renderTracks();
+        saveTrackToCloud(track);
+        playTrack(0);
+
+    } catch(e) {
+        console.error('Generation error:', e);
+        alert('Error: ' + e.message);
+    } finally {
+        clearInterval(timer);
+        document.getElementById('progressPanel').classList.add('hidden');
+        btn.disabled = false;
+        btnText.textContent = 'Create';
+    }
+}
+
+// ============================================================
+// Cloudinary
+// ============================================================
+async function saveTrackToCloud(track) {
+    try {
+        const reader = new FileReader();
+        reader.onloadend = async () => {
+            const base64 = reader.result.split(',')[1];
+            const resp = await fetch('/cloudinary/upload', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    base64: base64,
+                    title: track.title,
+                    prompt: track.prompt,
+                    model: track.model,
+                })
+            });
+            const data = await resp.json();
+            if (data.success) {
+                track.cloudUrl = data.url;
+                track.cloudId = data.public_id;
+            }
+        };
+        reader.readAsDataURL(track.blob);
+    } catch(e) {
+        console.warn('Cloudinary upload skipped:', e);
+    }
+}
+
+async function loadTracks() {
+    try {
+        const resp = await fetch('/cloudinary/history');
+        const data = await resp.json();
+        const existingIds = new Set(tracks.map(t => t.cloudId).filter(Boolean));
+        for (const t of (data.tracks || [])) {
+            if (!existingIds.has(t.public_id)) {
+                tracks.push({
+                    id: Date.now() + Math.random(),
+                    title: t.title || 'Untitled',
+                    prompt: t.prompt || '',
+                    model: t.model || 'music-2.6',
+                    duration: t.duration || 0,
+                    url: `/cloudinary/download/${encodeURIComponent(t.public_id)}`,
+                    cloudUrl: t.url,
+                    cloudId: t.public_id,
+                    createdAt: t.created_at,
+                });
+            }
+        }
+        renderTracks();
+    } catch(e) {
+        console.warn('Failed to load cloud tracks:', e);
+    }
+}
+
+// ============================================================
+// Track List
+// ============================================================
+function renderTracks() {
+    const container = document.getElementById('trackList');
+    if (tracks.length === 0) {
+        container.innerHTML = `
+            <div class="text-center py-16">
+                <span class="material-icons-outlined text-5xl text-gray-700">library_music</span>
+                <p class="text-gray-600 mt-3 text-sm">No tracks yet</p>
+                <p class="text-gray-700 text-xs mt-1">Your generated music will appear here</p>
+            </div>`;
+        return;
+    }
+
+    container.innerHTML = tracks.map((track, i) => `
+        <div class="track-row flex items-center gap-3 p-3 rounded-lg cursor-pointer ${i === currentTrackIndex ? 'playing' : ''}"
+             onclick="playTrack(${i})" data-index="${i}">
+            <div class="w-12 h-12 rounded-lg ${i === currentTrackIndex && isPlaying ? 'playing-indicator' : ''} bg-surface-2 flex items-center justify-center flex-shrink-0 relative">
+                <span class="material-icons-outlined ${i === currentTrackIndex && isPlaying ? 'text-primary' : 'text-gray-500'} text-xl">
+                    ${i === currentTrackIndex && isPlaying ? 'graphic_eq' : 'music_note'}
+                </span>
+                ${track.duration ? `<span class="absolute bottom-0.5 right-0.5 text-[8px] text-gray-400 bg-black/60 px-1 rounded">${formatTime(track.duration)}</span>` : ''}
+            </div>
+            <div class="flex-1 min-w-0">
+                <div class="flex items-center gap-2">
+                    <p class="text-sm font-medium text-white truncate">${track.title}</p>
+                    <span class="text-[10px] px-1.5 py-0.5 rounded bg-surface-3 text-gray-400 flex-shrink-0">${track.model}</span>
+                </div>
+                <p class="text-xs text-gray-500 truncate mt-0.5">${track.prompt}</p>
+            </div>
+            <div class="flex items-center gap-1">
+                <button onclick="event.stopPropagation(); downloadTrack(${i})" class="p-1.5 rounded hover:bg-surface-3 text-gray-400 hover:text-white transition-colors" title="Download">
+                    <span class="material-icons-outlined text-sm">download</span>
+                </button>
+                ${track.cloudId ? `<button onclick="event.stopPropagation(); deleteTrack(${i})" class="p-1.5 rounded hover:bg-surface-3 text-gray-400 hover:text-red-400 transition-colors" title="Delete">
+                    <span class="material-icons-outlined text-sm">delete</span>
+                </button>` : ''}
+            </div>
+        </div>
+    `).join('');
+}
+
+function formatTime(seconds) {
+    if (!seconds) return '0:00';
+    const m = Math.floor(seconds / 60);
+    const s = Math.floor(seconds % 60);
+    return `${m}:${s.toString().padStart(2, '0')}`;
+}
+
+// ============================================================
+// Audio Player
+// ============================================================
+function setupAudioEvents() {
+    audio.addEventListener('timeupdate', () => {
+        if (audio.duration) {
+            const pct = (audio.currentTime / audio.duration) * 100;
+            document.getElementById('progressSlider').value = pct;
+            document.getElementById('currentTime').textContent = formatTime(audio.currentTime);
+            document.getElementById('totalTime').textContent = formatTime(audio.duration);
+        }
+    });
+
+    audio.addEventListener('ended', () => {
+        if (currentTrackIndex < tracks.length - 1) {
+            nextTrack();
+        } else {
+            isPlaying = false;
+            updatePlayButton();
+        }
+    });
+
+    audio.volume = 0.8;
+}
+
+function playTrack(index) {
+    const track = tracks[index];
+    if (!track) return;
+
+    currentTrackIndex = index;
+    audio.src = track.url;
+    audio.play().catch(e => console.warn('Playback error:', e));
+    isPlaying = true;
+
+    document.getElementById('playerTitle').textContent = track.title;
+    document.getElementById('playerStyle').textContent = track.prompt;
+    document.getElementById('playerBar').classList.remove('hidden');
+
+    updatePlayButton();
+    renderTracks();
+}
+
+function togglePlay() {
+    if (currentTrackIndex === -1 && tracks.length > 0) {
+        playTrack(0);
+        return;
+    }
+    if (isPlaying) {
+        audio.pause();
+    } else {
+        audio.play();
+    }
+    isPlaying = !isPlaying;
+    updatePlayButton();
+    renderTracks();
+}
+
+function updatePlayButton() {
+    document.getElementById('playIcon').textContent = isPlaying ? 'pause' : 'play_arrow';
+}
+
+function nextTrack() {
+    if (currentTrackIndex < tracks.length - 1) {
+        playTrack(currentTrackIndex + 1);
+    }
+}
+
+function prevTrack() {
+    if (audio.currentTime > 3) {
+        audio.currentTime = 0;
+    } else if (currentTrackIndex > 0) {
+        playTrack(currentTrackIndex - 1);
+    }
+}
+
+function seekTrack(value) {
+    if (audio.duration) {
+        audio.currentTime = (value / 100) * audio.duration;
+    }
+}
+
+function setVolume(value) {
+    audio.volume = value / 100;
+    document.getElementById('volumeIcon').textContent = value == 0 ? 'volume_off' : value < 50 ? 'volume_down' : 'volume_up';
+}
+
+function toggleMute() {
+    const slider = document.getElementById('volumeSlider');
+    if (audio.volume > 0) {
+        audio.volume = 0;
+        slider.value = 0;
+    } else {
+        audio.volume = 0.8;
+        slider.value = 80;
+    }
+    setVolume(slider.value);
+}
+
+function toggleShuffle() {
+    // TODO
+}
+
+function toggleRepeat() {
+    audio.loop = !audio.loop;
+    event.target.closest('button').classList.toggle('text-primary', audio.loop);
+}
+
+// ============================================================
+// Actions
+// ============================================================
+function downloadTrack(index) {
+    const track = tracks[index];
+    if (!track) return;
+    const a = document.createElement('a');
+    a.href = track.url;
+    a.download = `${track.title.replace(/[^a-zA-Z0-9 ]/g, '')}.mp3`;
+    a.click();
+}
+
+async function deleteTrack(index) {
+    const track = tracks[index];
+    if (!track || !track.cloudId) return;
+    if (!confirm(`Delete "${track.title}"?`)) return;
+
+    try {
+        await fetch(`/cloudinary/delete/${encodeURIComponent(track.cloudId)}`, { method: 'DELETE' });
+        tracks.splice(index, 1);
+        if (currentTrackIndex === index) {
+            audio.pause();
+            isPlaying = false;
+            currentTrackIndex = -1;
+        } else if (currentTrackIndex > index) {
+            currentTrackIndex--;
+        }
+        renderTracks();
+    } catch(e) {
+        console.error('Delete error:', e);
+    }
+}
+</script>
+
+</body>
+</html>
