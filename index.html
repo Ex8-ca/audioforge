@@ -93,17 +93,21 @@ tailwind.config = {
                         Lyrics
                     </h2>
                     <div class="flex items-center gap-2">
-                        <label class="flex items-center gap-1.5 text-xs text-gray-400 cursor-pointer" title="Let AI write lyrics from your style. Type a lyric idea in the box — AI will turn it into a full song.">
+                        <label class="flex items-center gap-1.5 text-xs text-gray-400 cursor-pointer" title="When checked, AI writes lyrics from your idea + style during Create. Leave unchecked to use whatever's in the box as-is.">
                             <input type="checkbox" id="autoLyricsToggle" class="rounded bg-surface-3 border-gray-600 text-primary focus:ring-primary" onchange="onAutoLyricsChange()">
                             AI lyrics
                         </label>
+                        <button onclick="generateLyrics()" class="text-xs text-accent hover:text-violet-300 flex items-center gap-0.5" title="Preview lyrics now — AI expands the idea in the box (or invents from style if empty).">
+                            <span class="material-icons-outlined text-sm">auto_fix_high</span>
+                            Generate
+                        </button>
                         <button onclick="insertLyricsStructure()" class="text-xs text-gray-400 hover:text-gray-300 flex items-center gap-0.5" title="Insert song structure template">
                             <span class="material-icons-outlined text-sm">note_add</span>
                         </button>
                     </div>
                 </div>
                 <div class="p-3">
-                    <textarea id="lyricsInput" rows="8" placeholder="Leave empty for AI to write everything from your style.&#10;Type a one-line idea ('a song about lost love on a rainy night') and AI will expand it.&#10;Or paste full lyrics with tags like [verse], [chorus] — those pass through unchanged.&#10;&#10;Tip: Use tags like [verse], [chorus], [bridge], [intro], [outro]"
+                    <textarea id="lyricsInput" rows="8" placeholder="Paste a lyric idea ('a song about lost love on a rainy night') and hit Generate to expand it.&#10;Or hit Generate with this empty and AI invents from your style.&#10;Or paste full lyrics with tags like [verse], [chorus] — those pass through.&#10;&#10;Tip: Use tags like [verse], [chorus], [bridge], [intro], [outro]"
                         class="w-full bg-surface-2 border border-gray-700 rounded-lg px-3 py-2.5 text-sm text-gray-200 placeholder-gray-600 focus:outline-none focus:border-primary resize-none font-mono leading-relaxed" style="max-height: 200px;"></textarea>
                 </div>
             </div>
@@ -406,15 +410,60 @@ function insertLyricsStructure() {
     }
 }
 
+// Shared lyrics fetch — used by the Generate button (preview) and by Create (when AI lyrics is on).
+// Returns the generated lyrics string. Throws on failure.
+async function fetchLyrics(style, idea) {
+    const themePrompt = idea
+        ? `Style: ${style || 'any'}\nTheme/idea: ${idea}\nWrite a complete song with [verse], [chorus], [bridge] structure.`
+        : `Write lyrics for: ${style || 'a song about life and dreams'}`;
+
+    const resp = await fetch('/music/lyrics', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt: themePrompt, mode: 'write_full_song' })
+    });
+    if (!resp.ok) {
+        const err = await resp.json().catch(() => ({}));
+        throw new Error(err.error || 'Lyrics generation failed');
+    }
+    const data = await resp.json();
+    if (!data.lyrics) throw new Error('No lyrics returned — try a more specific idea or add a style');
+    return data.lyrics;
+}
+
+// Standalone Generate button — preview AI-written lyrics before committing to music gen.
+// Reads the textarea (idea, partial lyrics, or empty) as the theme + style as context.
+// Always fills the textarea with the result. Does NOT generate music.
+async function generateLyrics() {
+    const style = document.getElementById('styleInput').value.trim();
+    const idea = document.getElementById('lyricsInput').value.trim();
+
+    const btn = event.target.closest('button');
+    const origHTML = btn.innerHTML;
+    btn.innerHTML = '<span class="material-icons-outlined text-sm animate-spin">progress_activity</span>';
+    btn.disabled = true;
+
+    try {
+        const lyrics = await fetchLyrics(style, idea);
+        document.getElementById('lyricsInput').value = lyrics;
+    } catch(e) {
+        console.error('Lyrics error:', e);
+        alert('Could not generate lyrics: ' + e.message);
+    } finally {
+        btn.innerHTML = origHTML;
+        btn.disabled = false;
+    }
+}
+
 function onAutoLyricsChange() {
     const checked = document.getElementById('autoLyricsToggle').checked;
     const lyricsInput = document.getElementById('lyricsInput');
-    // Toggle hint via placeholder so user knows what mode they're in.
+    // Update placeholder hint so user knows what role the box plays when Create is hit.
     if (checked) {
-        lyricsInput.placeholder = "Optional: type a lyric idea ('lost love on a rainy night') and AI will write a full song from it. Leave empty and AI invents from your style.";
+        lyricsInput.placeholder = "Type a lyric idea ('lost love on a rainy night') here. When you hit Create, AI will expand it into full lyrics. Or leave empty and AI invents from your style.";
         lyricsInput.dataset.mode = 'ai';
     } else {
-        lyricsInput.placeholder = "Optional: type a one-line idea OR paste full lyrics with [verse]/[chorus] tags. AI writes lyrics only if this contains no structure tags.";
+        lyricsInput.placeholder = "Paste a lyric idea ('a song about lost love on a rainy night') and hit Generate to expand it.&#10;Or hit Generate with this empty and AI invents from your style.&#10;Or paste full lyrics with tags like [verse], [chorus] — those pass through.&#10;&#10;Tip: Use tags like [verse], [chorus], [bridge], [intro], [outro]";
         lyricsInput.dataset.mode = 'manual';
     }
 }
@@ -423,27 +472,6 @@ function onAutoLyricsChange() {
 // vs a plain lyric idea (free text only).
 function hasStructureTags(text) {
     return /\[\s*(verse|chorus|bridge|intro|outro|hook|pre[\s_-]?chorus|post[\s_-]?chorus|interlude|break|build[\s_-]?up|inst(rumental)?|solo|transition|end)\b/i.test(text);
-}
-
-// Call /music/lyrics and return the generated string. Used by generate() in AI mode.
-async function generateLyricsFromTheme(theme, songContext = '') {
-    const resp = await fetch('/music/lyrics', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-            prompt: songContext
-                ? `Style: ${theme}\nTheme/idea: ${songContext}\nWrite a complete song with [verse], [chorus], [bridge] structure.`
-                : `Write lyrics for: ${theme}`,
-            mode: 'write_full_song'
-        })
-    });
-    if (!resp.ok) {
-        const err = await resp.json().catch(() => ({}));
-        throw new Error(err.error || 'Lyrics generation failed');
-    }
-    const data = await resp.json();
-    if (!data.lyrics) throw new Error('No lyrics returned — try a more specific theme');
-    return data.lyrics;
 }
 
 // ============================================================
@@ -532,13 +560,13 @@ async function generate() {
                 resolvedLyrics = lyrics;
                 document.getElementById('progressText').textContent = 'Composing with your lyrics...';
             } else if (autoLyrics) {
-                // AI writes lyrics. The textarea content (if any) is the idea/theme.
+                // AI writes lyrics during Create. The textarea content (if any) is the idea/theme.
                 document.getElementById('progressText').textContent = 'Writing lyrics...';
                 document.getElementById('progressSubtext').textContent = lyrics
                     ? 'Composing lyrics from your idea + style'
                     : 'Composing lyrics from your style';
                 try {
-                    resolvedLyrics = await generateLyricsFromTheme(fullPrompt, lyrics);
+                    resolvedLyrics = await fetchLyrics(fullPrompt, lyrics);
                     // Show the user what was generated so they can edit/regenerate next time
                     document.getElementById('lyricsInput').value = resolvedLyrics;
                 } catch (lyrErr) {
