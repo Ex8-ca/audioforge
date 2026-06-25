@@ -1,51 +1,51 @@
 #!/usr/bin/env python3
-"""audioforge — MiniMax music generation proxy + Cloudinary history."""
+"""audioforge — MiniMax music generation proxy + local NVMe storage."""
 import http.server
 import urllib.request
 import urllib.error
 import os
 import json
 import time
-import io
+import uuid
 import base64
-import cloudinary
-import cloudinary.uploader
-import cloudinary.api
 
-# MiniMax config — loads from minimax-speech .env
-def _load_minimax_key():
-    env_path = os.path.expanduser("~/.hermes/skills/minimax-speech/.env")
-    if os.path.exists(env_path):
-        with open(env_path) as f:
-            for line in f:
-                line = line.strip()
-                if line.startswith("MINIMAX_API_KEY=") and not line.startswith("#"):
-                    return line.split("=", 1)[1].strip().strip('"').strip("'")
-    return os.environ.get("MINIMAX_API_KEY", "")
-
-MINIMAX_API_KEY = _load_minimax_key()
+# MiniMax config — set MINIMAX_API_KEY in your environment or a .env loader.
+MINIMAX_API_KEY = os.environ.get("MINIMAX_API_KEY", "")
 MINIMAX_MUSIC_URL = "https://api.minimax.io/v1/music_generation"
 MINIMAX_LYRICS_URL = "https://api.minimax.io/v1/lyrics_generation"
 
-# Cloudinary config — loads from .env
-def _load_cloudinary():
-    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-    if os.path.exists(env_path):
-        with open(env_path) as f:
-            for line in f:
-                line = line.strip()
-                if line.startswith("#") or not line:
-                    continue
-                key, val = line.split("=", 1)
-                os.environ[f"CLOUDINARY_{key.upper()}"] = val.strip()
-    cloudinary.config(
-        cloud_name=os.environ.get("CLOUDINARY_CLOUD_NAME", ""),
-        api_key=os.environ.get("CLOUDINARY_API_KEY", ""),
-        api_secret=os.environ.get("CLOUDINARY_API_SECRET", ""),
-        secure=True,
-    )
+# Local storage config
+MEDIA_DIR = os.path.expanduser("~/nvme-data/audioforge/media")
+TRACKS_FILE = os.path.expanduser("~/nvme-data/audioforge/tracks.json")
+os.makedirs(MEDIA_DIR, exist_ok=True)
 
-_load_cloudinary()
+def _load_tracks():
+    if os.path.exists(TRACKS_FILE):
+        with open(TRACKS_FILE) as f:
+            return json.load(f)
+    return {"tracks": []}
+
+def _save_tracks(data):
+    with open(TRACKS_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+def _create_track_record(title, prompt, model, duration_ms, filename):
+    """Create a track record in tracks.json."""
+    track_id = f"audioforge_{int(time.time())}_{uuid.uuid4().hex[:8]}"
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    track = {
+        "id": track_id,
+        "filename": filename,
+        "title": title,
+        "prompt": prompt,
+        "model": model,
+        "created_at": now,
+        "duration": duration_ms / 1000.0 if duration_ms else 0,
+    }
+    tracks_data = _load_tracks()
+    tracks_data["tracks"].insert(0, track)
+    _save_tracks(tracks_data)
+    return track_id
 
 FRONTEND_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -54,11 +54,12 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
         super().__init__(*args, directory=FRONTEND_DIR, **kwargs)
 
     def do_GET(self):
-        if self.path == "/cloudinary/history":
-            self.serve_cloudinary_history()
-        elif self.path.startswith("/cloudinary/download/"):
-            public_id = self.path[len("/cloudinary/download/"):]
-            self.handle_cloudinary_download(public_id)
+        if self.path == "/tracks":
+            self.serve_tracks_list()
+        elif self.path.startswith("/tracks/") and not self.path.endswith("/metadata"):
+            # /tracks/{id} — serve audio file
+            track_id = self.path[len("/tracks/"):]
+            self.handle_track_download(track_id)
         else:
             super().do_GET()
 
@@ -67,15 +68,16 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
             self.handle_music_generate()
         elif self.path == "/music/lyrics":
             self.handle_lyrics_generate()
-        elif self.path == "/cloudinary/upload":
-            self.handle_cloudinary_upload()
+        elif self.path.endswith("/metadata"):
+            # /tracks/{id}/metadata — just register metadata (fallback)
+            self.handle_track_metadata()
         else:
             self.send_error(404)
 
     def do_DELETE(self):
-        if self.path.startswith("/cloudinary/delete/"):
-            public_id = self.path[len("/cloudinary/delete/"):]
-            self.handle_cloudinary_delete(public_id)
+        if self.path.startswith("/tracks/"):
+            track_id = self.path[len("/tracks/"):]
+            self.handle_track_delete(track_id)
         else:
             self.send_error(404)
 
@@ -87,7 +89,7 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
         self.end_headers()
 
     # ================================================================
-    # MiniMax: generate music
+    # MiniMax: generate music (saves to local NVMe)
     # ================================================================
     def handle_music_generate(self):
         try:
@@ -95,12 +97,20 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
             body = json.loads(self.rfile.read(content_len))
             prompt = body.get("prompt", "")
             lyrics = body.get("lyrics", "")
+            title = body.get("title", "")
             model = body.get("model", "music-2.6")
             is_instrumental = body.get("is_instrumental", False)
-            auto_lyrics = body.get("auto_generate_lyrics", False)
+            auto_lyrics = body.get("lyrics_optimizer", False)
 
             if not prompt:
                 self.send_json_error(400, "Missing style prompt")
+                return
+
+            if len(prompt) > 2000:
+                self.send_json_error(400, f"Style prompt too long ({len(prompt)} chars, max 2000)")
+                return
+            if lyrics and len(lyrics) > 3500:
+                self.send_json_error(400, f"Lyrics too long ({len(lyrics)} chars, max 3500)")
                 return
 
             if not MINIMAX_API_KEY:
@@ -122,7 +132,7 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
             elif lyrics:
                 payload["lyrics"] = lyrics
             elif auto_lyrics:
-                payload["auto_generate_lyrics"] = True
+                payload["lyrics_optimizer"] = True
 
             req_data = json.dumps(payload).encode()
             req = urllib.request.Request(
@@ -150,17 +160,28 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
 
             audio_bytes = bytes.fromhex(audio_hex)
             extra = result.get("extra_info", {})
+            duration_ms = extra.get("music_duration", 0)
+
+            # Save to local NVMe drive
+            filename = f"audioforge_{int(time.time())}_{uuid.uuid4().hex[:8]}.mp3"
+            filepath = os.path.join(MEDIA_DIR, filename)
+            with open(filepath, "wb") as f:
+                f.write(audio_bytes)
+
+            # Register track
+            track_id = _create_track_record(title, prompt, model, duration_ms, filename)
 
             self.send_response(200)
             self.send_header("Content-Type", "audio/mpeg")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Content-Length", len(audio_bytes))
-            self.send_header("X-Duration", str(extra.get("music_duration", 0)))
+            self.send_header("X-Duration", str(duration_ms))
             self.send_header("X-Size", str(extra.get("music_size", 0)))
+            self.send_header("X-Track-Id", track_id)
             self.end_headers()
             self.wfile.write(audio_bytes)
 
-            self.log_message("Generated %d bytes, %dms", len(audio_bytes), extra.get("music_duration", 0))
+            self.log_message("Generated %d bytes, %dms, track=%s", len(audio_bytes), duration_ms, track_id)
 
         except urllib.error.HTTPError as e:
             err_body = e.read() if e.fp else b""
@@ -207,8 +228,9 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
                 self.send_json_error(500, f"MiniMax error: {base_resp.get('status_msg', 'Unknown')}")
                 return
 
-            # Lyrics can be at top level or in data
             lyrics = result.get("lyrics", "") or result.get("data", {}).get("lyrics", "")
+            if not lyrics:
+                self.log_message("Lyrics generation returned empty. Response: %s", json.dumps(result)[:500])
             self.send_json_ok({"lyrics": lyrics})
 
         except Exception as e:
@@ -216,87 +238,74 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
             self.send_json_error(500, str(e))
 
     # ================================================================
-    # Cloudinary: upload audio
+    # Local storage: register metadata (fallback)
     # ================================================================
-    def handle_cloudinary_upload(self):
+    def handle_track_metadata(self):
         try:
             content_len = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(content_len))
-            audio_b64 = body.get("base64", "")
-            title = body.get("title", "")
-            prompt = body.get("prompt", "")
-            model = body.get("model", "music-2.6")
+            track_id = self.path.split("/")[2]  # /tracks/{id}/metadata
 
-            if not audio_b64:
-                self.send_json_error(400, "Missing base64 audio")
-                return
+            # Update existing track
+            tracks_data = _load_tracks()
+            for t in tracks_data.get("tracks", []):
+                if t.get("id") == track_id:
+                    t.update({k: v for k, v in body.items() if v})
+                    _save_tracks(tracks_data)
+                    self.send_json_ok({"id": track_id})
+                    return
 
-            audio_bytes = base64.b64decode(audio_b64)
-
-            result = cloudinary.uploader.upload(
-                io.BytesIO(audio_bytes),
-                folder="audioforge",
-                resource_type="auto",
-                public_id=f"audioforge_{int(time.time())}",
-            )
-
-            self.send_json_ok({
-                "success": True,
-                "url": result.get("secure_url", ""),
-                "public_id": result.get("public_id", ""),
-                "title": title,
-                "prompt": prompt,
-                "model": model,
-                "created_at": result.get("created_at", ""),
-            })
-
+            self.send_json_error(404, "Track not found")
         except Exception as e:
-            self.log_message("Cloudinary upload error: %s", str(e))
             self.send_json_error(500, str(e))
 
     # ================================================================
-    # Cloudinary: list recent tracks
+    # Local storage: list all tracks
     # ================================================================
-    def serve_cloudinary_history(self):
+    def serve_tracks_list(self):
         try:
-            result = cloudinary.api.resources(
-                type="upload",
-                prefix="audioforge/",
-                max_results=50,
-                sort_by=[("created_at", "desc")],
-            )
-
+            tracks_data = _load_tracks()
             tracks = []
-            for res in result.get("resources", []):
-                meta = res.get("context", {}).get("custom", {})
+            for t in tracks_data.get("tracks", []):
+                filepath = os.path.join(MEDIA_DIR, t.get("filename", ""))
+                exists = os.path.exists(filepath)
                 tracks.append({
-                    "url": res.get("secure_url", ""),
-                    "public_id": res.get("public_id", ""),
-                    "title": meta.get("title", res.get("public_id", "").replace("audioforge_", "")),
-                    "prompt": meta.get("prompt", ""),
-                    "model": meta.get("model", "music-2.6"),
-                    "created_at": res.get("created_at", ""),
-                    "duration": res.get("duration", 0),
+                    "id": t.get("id", ""),
+                    "title": t.get("title", "Untitled"),
+                    "prompt": t.get("prompt", ""),
+                    "model": t.get("model", "music-2.6"),
+                    "created_at": t.get("created_at", ""),
+                    "duration": t.get("duration", 0),
+                    "exists": exists,
                 })
-
             self.send_json_ok({"tracks": tracks})
-
         except Exception as e:
-            self.log_message("Cloudinary history error: %s", str(e))
+            self.log_message("Track list error: %s", str(e))
             self.send_json_ok({"tracks": [], "error": str(e)})
 
     # ================================================================
-    # Cloudinary: download audio
+    # Local storage: download audio
     # ================================================================
-    def handle_cloudinary_download(self, public_id):
+    def handle_track_download(self, track_id):
         try:
-            decoded_id = urllib.parse.unquote(public_id)
-            resource = cloudinary.api.resource(decoded_id)
-            audio_url = resource.get("secure_url", "")
+            tracks_data = _load_tracks()
+            track = None
+            for t in tracks_data.get("tracks", []):
+                if t.get("id") == track_id:
+                    track = t
+                    break
 
-            req = urllib.request.Request(audio_url)
-            with urllib.request.urlopen(req, timeout=60) as resp:
-                data = resp.read()
+            if not track:
+                self.send_error(404)
+                return
+
+            filepath = os.path.join(MEDIA_DIR, track.get("filename", ""))
+            if not os.path.exists(filepath):
+                self.send_error(404)
+                return
+
+            with open(filepath, "rb") as f:
+                data = f.read()
 
             self.send_response(200)
             self.send_header("Content-Type", "audio/mpeg")
@@ -306,17 +315,33 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
             self.wfile.write(data)
 
         except Exception as e:
-            self.log_message("Cloudinary download error: %s", str(e))
+            self.log_message("Track download error: %s", str(e))
             self.send_error(500)
 
     # ================================================================
-    # Cloudinary: delete
+    # Local storage: delete
     # ================================================================
-    def handle_cloudinary_delete(self, public_id):
+    def handle_track_delete(self, track_id):
         try:
-            decoded_id = urllib.parse.unquote(public_id)
-            result = cloudinary.uploader.destroy(decoded_id, resource_type="auto")
-            self.send_json_ok({"success": result.get("result") == "ok"})
+            tracks_data = _load_tracks()
+            track = None
+            for t in tracks_data.get("tracks", []):
+                if t.get("id") == track_id:
+                    track = t
+                    break
+
+            if not track:
+                self.send_json_error(404, "Track not found")
+                return
+
+            filepath = os.path.join(MEDIA_DIR, track.get("filename", ""))
+            if os.path.exists(filepath):
+                os.remove(filepath)
+
+            tracks_data["tracks"] = [t for t in tracks_data["tracks"] if t.get("id") != track_id]
+            _save_tracks(tracks_data)
+
+            self.send_json_ok({"success": True})
         except Exception as e:
             self.send_json_error(500, str(e))
 
@@ -342,7 +367,7 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
         self.wfile.write(body)
 
     def end_headers(self):
-        if not self.path.startswith("/cloudinary/"):
+        if not self.path.startswith("/tracks/"):
             self.send_header("Cache-Control", "no-cache")
         super().end_headers()
 
@@ -351,12 +376,11 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
 
 if __name__ == "__main__":
     import sys
-    import urllib.parse
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8989
     server = http.server.HTTPServer(("0.0.0.0", port), ProxyHandler)
     print(f"audioforge running at http://192.168.1.3:{port}")
     print(f"MiniMax music: {'configured' if MINIMAX_API_KEY else 'NOT configured'}")
-    print(f"Cloudinary uploads -> dol2t3l5x")
+    print(f"Local storage -> {MEDIA_DIR}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

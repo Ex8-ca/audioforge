@@ -339,8 +339,8 @@ function renderPresets() {
     const grid = document.getElementById('presetGrid');
     grid.innerHTML = PRESETS.map(p => `
         <button onclick="applyPreset('${p.prompt}')"
-            class="flex items-center gap-2 px-2.5 py-2 rounded-lg bg-surface-2 border border-gray-700 hover:border-primary/50 hover:bg-primary/5 transition-all text-left min-w-0">
-            <span class="material-icons-outlined text-primary text-sm flex-shrink-0">${p.icon}</span>
+            class="flex items-center justify-start gap-1.5 px-2 py-1.5 rounded-lg bg-surface-2 border border-gray-700 hover:border-primary/50 hover:bg-primary/5 transition-all text-left w-full overflow-hidden">
+            <span class="material-icons-outlined text-primary text-sm flex-shrink-0 w-4 text-center leading-none">${p.icon}</span>
             <span class="text-xs text-gray-300 font-medium truncate leading-tight">${p.name}</span>
         </button>
     `).join('');
@@ -530,9 +530,10 @@ async function generate() {
             body: JSON.stringify({
                 prompt: fullPrompt,
                 lyrics: isInstrumental ? '' : lyrics,
+                title: title,
                 model: model,
                 is_instrumental: isInstrumental,
-                auto_generate_lyrics: autoLyrics && !lyrics,
+                lyrics_optimizer: autoLyrics && !lyrics,
             })
         });
 
@@ -546,11 +547,12 @@ async function generate() {
         }
 
         const duration = resp.headers.get('X-Duration') || '0';
+        const trackId = resp.headers.get('X-Track-Id') || `audioforge_${Date.now()}`;
         const blob = await resp.blob();
         const audioUrl = URL.createObjectURL(blob);
 
         const track = {
-            id: Date.now(),
+            id: trackId,
             title: title,
             prompt: fullPrompt,
             model: model,
@@ -563,7 +565,7 @@ async function generate() {
 
         tracks.unshift(track);
         renderTracks();
-        saveTrackToCloud(track);
+        registerTrack(track);
         playTrack(0);
 
     } catch(e) {
@@ -578,58 +580,51 @@ async function generate() {
 }
 
 // ============================================================
-// Cloudinary
+// Local Storage
 // ============================================================
-async function saveTrackToCloud(track) {
+async function registerTrack(track) {
     try {
-        const reader = new FileReader();
-        reader.onloadend = async () => {
-            const base64 = reader.result.split(',')[1];
-            const resp = await fetch('/cloudinary/upload', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    base64: base64,
-                    title: track.title,
-                    prompt: track.prompt,
-                    model: track.model,
-                })
-            });
-            const data = await resp.json();
-            if (data.success) {
-                track.cloudUrl = data.url;
-                track.cloudId = data.public_id;
-            }
-        };
-        reader.readAsDataURL(track.blob);
+        const resp = await fetch(`/tracks/${track.id}/metadata`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                title: track.title,
+                prompt: track.prompt,
+                model: track.model,
+                duration: track.duration,
+            })
+        });
+        const data = await resp.json();
+        if (data.id) {
+            track.cloudId = data.id;  // reuse for delete button logic
+        }
     } catch(e) {
-        console.warn('Cloudinary upload skipped:', e);
+        console.warn('Track registration skipped:', e);
     }
 }
 
 async function loadTracks() {
     try {
-        const resp = await fetch('/cloudinary/history');
+        const resp = await fetch('/tracks');
         const data = await resp.json();
-        const existingIds = new Set(tracks.map(t => t.cloudId).filter(Boolean));
+        const existingIds = new Set(tracks.map(t => t.id).filter(Boolean));
         for (const t of (data.tracks || [])) {
-            if (!existingIds.has(t.public_id)) {
+            if (!existingIds.has(t.id)) {
                 tracks.push({
-                    id: Date.now() + Math.random(),
+                    id: t.id,
                     title: t.title || 'Untitled',
                     prompt: t.prompt || '',
                     model: t.model || 'music-2.6',
                     duration: t.duration || 0,
-                    url: `/cloudinary/download/${encodeURIComponent(t.public_id)}`,
-                    cloudUrl: t.url,
-                    cloudId: t.public_id,
+                    url: `/tracks/${t.id}`,
+                    cloudId: t.id,
                     createdAt: t.created_at,
                 });
             }
         }
         renderTracks();
     } catch(e) {
-        console.warn('Failed to load cloud tracks:', e);
+        console.warn('Failed to load tracks:', e);
     }
 }
 
@@ -668,9 +663,9 @@ function renderTracks() {
                 <button onclick="event.stopPropagation(); downloadTrack(${i})" class="p-1.5 rounded hover:bg-surface-3 text-gray-400 hover:text-white transition-colors" title="Download">
                     <span class="material-icons-outlined text-sm">download</span>
                 </button>
-                ${track.cloudId ? `<button onclick="event.stopPropagation(); deleteTrack(${i})" class="p-1.5 rounded hover:bg-surface-3 text-gray-400 hover:text-red-400 transition-colors" title="Delete">
+                <button onclick="event.stopPropagation(); deleteTrack(${i})" class="p-1.5 rounded hover:bg-surface-3 text-gray-400 hover:text-red-400 transition-colors" title="Delete">
                     <span class="material-icons-outlined text-sm">delete</span>
-                </button>` : ''}
+                </button>
             </div>
         </div>
     `).join('');
@@ -804,11 +799,11 @@ function downloadTrack(index) {
 
 async function deleteTrack(index) {
     const track = tracks[index];
-    if (!track || !track.cloudId) return;
+    if (!track || !track.id) return;
     if (!confirm(`Delete "${track.title}"?`)) return;
 
     try {
-        await fetch(`/cloudinary/delete/${encodeURIComponent(track.cloudId)}`, { method: 'DELETE' });
+        await fetch(`/tracks/${encodeURIComponent(track.id)}`, { method: 'DELETE' });
         tracks.splice(index, 1);
         if (currentTrackIndex === index) {
             audio.pause();
