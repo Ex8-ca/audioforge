@@ -12,7 +12,12 @@ import base64
 # MiniMax config — set MINIMAX_API_KEY in your environment or a .env loader.
 MINIMAX_API_KEY = os.environ.get("MINIMAX_API_KEY", "")
 MINIMAX_MUSIC_URL = "https://api.minimax.io/v1/music_generation"
-MINIMAX_LYRICS_URL = "https://api.minimax.io/v1/lyrics_generation"
+# Native MiniMax lyrics endpoint — currently flaky on MiniMax's side. We use M3
+# (MiniMax's text-completion proxy served via the Anthropic-compatible API)
+# as the primary lyrics backend instead. Set MINIMAX_LYRICS_BACKEND=minimax
+# in your env to fall back to the native endpoint if M3 is also down.
+MINIMAX_M3_URL = "https://api.minimax.io/anthropic/v1/messages"
+MINIMAX_LYRICS_BACKEND = os.environ.get("MINIMAX_LYRICS_BACKEND", "m3")
 
 # Local storage config
 MEDIA_DIR = os.path.expanduser("~/nvme-data/audioforge/media")
@@ -192,7 +197,8 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
             self.send_json_error(500, str(e))
 
     # ================================================================
-    # MiniMax: generate lyrics
+    # Lyrics generation — M3 (Claude via MiniMax Anthropic-compatible API) primary,
+    # native MiniMax lyrics endpoint as fallback.
     # ================================================================
     def handle_lyrics_generate(self):
         try:
@@ -209,33 +215,120 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
                 self.send_json_error(500, "MiniMax API key not configured")
                 return
 
-            payload = {"mode": mode, "prompt": prompt}
+            # Try M3 first (fast + reliable), fall back to native MiniMax lyrics.
+            lyrics = None
+            backend_used = None
+            last_err = None
 
-            req_data = json.dumps(payload).encode()
+            if MINIMAX_LYRICS_BACKEND in ("m3", "auto"):
+                try:
+                    lyrics = self._generate_lyrics_via_m3(prompt)
+                    backend_used = "m3"
+                except Exception as e:
+                    last_err = f"M3: {e}"
+                    self.log_message("M3 lyrics failed: %s", e)
+                    if MINIMAX_LYRICS_BACKEND == "m3":
+                        self.send_json_error(503, f"Lyrics generation failed (M3): {e}. Set MINIMAX_LYRICS_BACKEND=auto or minimax to use the native fallback.")
+                        return
+
+            if lyrics is None and MINIMAX_LYRICS_BACKEND in ("minimax", "auto"):
+                try:
+                    lyrics = self._generate_lyrics_via_minimax_native(prompt, mode)
+                    backend_used = "minimax"
+                except Exception as e:
+                    last_err = f"minimax: {e}"
+                    self.log_message("MiniMax native lyrics failed: %s", e)
+
+            if not lyrics:
+                self.send_json_error(503, f"Lyrics generation failed on all backends. Last error: {last_err}. Try again in a minute, or write lyrics manually.")
+                return
+
+            self.send_json_ok({"lyrics": lyrics, "backend": backend_used})
+
+        except Exception as e:
+            self.log_message("Lyrics error: %s", str(e))
+            self.send_json_error(500, str(e))
+
+    def _generate_lyrics_via_m3(self, prompt):
+        """Generate lyrics using M3 (Claude via MiniMax's Anthropic-compatible API)."""
+        # Wrap the user's prompt in a system instruction that ensures structured output.
+        # The frontend already composes a prompt like:
+        #   "Style: ...\nTheme/idea: ...\nWrite a complete song with [verse], [chorus], [bridge] structure."
+        # but if the user passes a thin prompt, we still want structure.
+        system_prompt = (
+            "You are a songwriter. Write song lyrics based on the user's prompt. "
+            "Use these section tags on their own lines: [Intro], [Verse], [Verse 1], [Verse 2], "
+            "[Pre-Chorus], [Chorus], [Post-Chorus], [Hook], [Bridge], [Interlude], [Break], "
+            "[Build Up], [Instrumental], [Solo], [Transition], [Outro]. "
+            "Always include at least [Verse], [Chorus], and [Outro]. "
+            "Output ONLY the lyrics — no preamble, no explanation, no markdown fences."
+        )
+
+        body = json.dumps({
+            "model": "claude-haiku-4-5",
+            "max_tokens": 1500,
+            "system": system_prompt,
+            "messages": [
+                {"role": "user", "content": prompt}
+            ],
+        }).encode()
+
+        req = urllib.request.Request(
+            MINIMAX_M3_URL,
+            data=body,
+            method="POST",
+        )
+        req.add_header("Content-Type", "application/json")
+        req.add_header("x-api-key", MINIMAX_API_KEY)
+        req.add_header("anthropic-version", "2023-06-01")
+
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            result = json.loads(resp.read())
+
+        # Anthropic-compatible response shape
+        content_blocks = result.get("content", [])
+        text_parts = [b.get("text", "") for b in content_blocks if b.get("type") == "text"]
+        lyrics = "\n".join(text_parts).strip()
+        if not lyrics:
+            raise ValueError(f"M3 returned empty content: {json.dumps(result)[:300]}")
+        return lyrics
+
+    def _generate_lyrics_via_minimax_native(self, prompt, mode):
+        """Generate lyrics using MiniMax's native /v1/lyrics_generation endpoint, with retry."""
+        payload = {"mode": mode, "prompt": prompt}
+        req_data = json.dumps(payload).encode()
+
+        last_err = None
+        for attempt in range(1, 4):
             req = urllib.request.Request(
-                MINIMAX_LYRICS_URL,
+                "https://api.minimax.io/v1/lyrics_generation",
                 data=req_data,
                 method="POST",
             )
             req.add_header("Content-Type", "application/json")
             req.add_header("Authorization", f"Bearer {MINIMAX_API_KEY}")
 
-            with urllib.request.urlopen(req, timeout=120) as resp:
-                result = json.loads(resp.read())
+            try:
+                with urllib.request.urlopen(req, timeout=120) as resp:
+                    result = json.loads(resp.read())
+                base_resp = result.get("base_resp", {})
+                if base_resp.get("status_code") != 0:
+                    last_err = base_resp.get("status_msg", "Unknown error")
+                    time.sleep(2 * attempt)
+                    continue
+                lyrics = result.get("lyrics", "") or result.get("data", {}).get("lyrics", "")
+                if lyrics:
+                    return lyrics
+                last_err = "Empty response from LLM"
+                time.sleep(2 * attempt)
+            except urllib.error.HTTPError as e:
+                last_err = f"HTTP {e.code}: {e.read().decode()[:200]}"
+                time.sleep(2 * attempt)
+            except Exception as e:
+                last_err = str(e)
+                time.sleep(2 * attempt)
 
-            base_resp = result.get("base_resp", {})
-            if base_resp.get("status_code") != 0:
-                self.send_json_error(500, f"MiniMax error: {base_resp.get('status_msg', 'Unknown')}")
-                return
-
-            lyrics = result.get("lyrics", "") or result.get("data", {}).get("lyrics", "")
-            if not lyrics:
-                self.log_message("Lyrics generation returned empty. Response: %s", json.dumps(result)[:500])
-            self.send_json_ok({"lyrics": lyrics})
-
-        except Exception as e:
-            self.log_message("Lyrics error: %s", str(e))
-            self.send_json_error(500, str(e))
+        raise RuntimeError(f"native fallback failed after 3 attempts: {last_err}")
 
     # ================================================================
     # Local storage: register metadata (fallback)

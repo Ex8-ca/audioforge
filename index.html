@@ -4,29 +4,9 @@
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
 <title>audioforge — AI Music Generator</title>
-<script src="https://cdn.tailwindcss.com?plugins=forms,typography"></script>
+<link rel="stylesheet" href="tailwind.min.css"/>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet"/>
 <link href="https://fonts.googleapis.com/icon?family=Material+Icons+Outlined" rel="stylesheet"/>
-<script>
-tailwind.config = {
-    darkMode: "class",
-    theme: {
-        extend: {
-            colors: {
-                primary: "#f43f5e",
-                "primary-hover": "#e11d48",
-                "primary-glow": "rgba(244,63,94,0.3)",
-                surface: "#111827",
-                "surface-2": "#1f2937",
-                "surface-3": "#374151",
-                border: "#4b5563",
-                accent: "#8b5cf6",
-            },
-            fontFamily: { sans: ["Inter", "sans-serif"] },
-        },
-    },
-};
-</script>
 <style>
     body { font-family: 'Inter', sans-serif; }
     .scrollbar-thin::-webkit-scrollbar { width: 5px; height: 5px; }
@@ -448,6 +428,15 @@ async function generateLyrics() {
         document.getElementById('lyricsInput').value = lyrics;
     } catch(e) {
         console.error('Lyrics error:', e);
+        // Service unavailable (MiniMax flaky) — offer an immediate retry or manual fallback
+        if (e.message.includes('service unavailable') || e.message.includes('503')) {
+            const retry = confirm('Lyrics service is having issues right now (MiniMax returned empty responses).\n\nClick OK to retry, or Cancel to write lyrics manually in the box.');
+            if (retry) {
+                // re-click the button by re-calling ourselves
+                setTimeout(() => generateLyrics.call(btn), 500);
+                return;
+            }
+        }
         alert('Could not generate lyrics: ' + e.message);
     } finally {
         btn.innerHTML = origHTML;
