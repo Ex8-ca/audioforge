@@ -19,6 +19,10 @@ MINIMAX_MUSIC_URL = "https://api.minimax.io/v1/music_generation"
 MINIMAX_M3_URL = "https://api.minimax.io/anthropic/v1/messages"
 MINIMAX_LYRICS_BACKEND = os.environ.get("MINIMAX_LYRICS_BACKEND", "m3")
 
+if not MINIMAX_API_KEY:
+    print("FATAL: MINIMAX_API_KEY is not set. Source your .env or export it before starting.", file=__import__("sys").stderr)
+    __import__("sys").exit(1)
+
 # Local storage config
 MEDIA_DIR = os.path.expanduser("~/nvme-data/audioforge/media")
 TRACKS_FILE = os.path.expanduser("~/nvme-data/audioforge/tracks.json")
