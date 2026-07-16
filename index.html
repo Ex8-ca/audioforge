@@ -262,6 +262,32 @@
 
 <audio id="audioPlayer" preload="none"></audio>
 
+<!-- Lyrics Modal -->
+<div id="lyricsModal" class="hidden fixed inset-0 bg-black/70 z-[100] flex items-center justify-center p-4" onclick="if(event.target===this) closeLyricsModal()">
+    <div class="bg-surface border border-gray-800 rounded-xl max-w-2xl w-full max-h-[80vh] flex flex-col shadow-2xl">
+        <div class="flex items-center justify-between px-5 py-3 border-b border-gray-800 flex-shrink-0">
+            <div class="flex items-center gap-3 min-w-0">
+                <span class="material-icons-outlined text-primary">lyrics</span>
+                <h3 class="text-base font-semibold text-white truncate" id="lyricsModalTitle">Lyrics</h3>
+            </div>
+            <div class="flex items-center gap-1 flex-shrink-0">
+                <button onclick="copyLyrics()" class="p-1.5 rounded hover:bg-surface-3 text-gray-400 hover:text-white transition-colors" title="Copy to clipboard">
+                    <span class="material-icons-outlined text-sm">content_copy</span>
+                </button>
+                <button onclick="closeLyricsModal()" class="p-1.5 rounded hover:bg-surface-3 text-gray-400 hover:text-white transition-colors" title="Close">
+                    <span class="material-icons-outlined text-sm">close</span>
+                </button>
+            </div>
+        </div>
+        <div class="p-5 overflow-y-auto scrollbar-thin flex-1">
+            <pre id="lyricsModalContent" class="text-sm text-gray-200 whitespace-pre-wrap font-mono leading-relaxed"></pre>
+        </div>
+        <div class="px-5 py-2 border-t border-gray-800 text-xs text-gray-500 flex-shrink-0">
+            Ready to paste into Bandcamp's track lyrics field.
+        </div>
+    </div>
+</div>
+
 <script>
 // ============================================================
 // Config
@@ -608,6 +634,8 @@ async function generate() {
             blob: blob,
             createdAt: new Date().toLocaleString(),
             isInstrumental: isInstrumental,
+            lyrics: resolvedLyrics || '',
+            coverUrl: null,
         };
 
         tracks.unshift(track);
@@ -639,6 +667,7 @@ async function registerTrack(track) {
                 prompt: track.prompt,
                 model: track.model,
                 duration: track.duration,
+                lyrics: track.lyrics || '',
             })
         });
         const data = await resp.json();
@@ -666,7 +695,16 @@ async function loadTracks() {
                     url: `/tracks/${t.id}`,
                     cloudId: t.id,
                     createdAt: t.created_at,
+                    lyrics: t.lyrics || '',
+                    coverUrl: t.cover_url || null,
                 });
+            } else {
+                // Refresh lyrics/cover on existing tracks (server is source of truth)
+                const existing = tracks.find(tr => tr.id === t.id);
+                if (existing) {
+                    existing.lyrics = t.lyrics || existing.lyrics || '';
+                    existing.coverUrl = t.cover_url || existing.coverUrl || null;
+                }
             }
         }
         renderTracks();
@@ -693,10 +731,12 @@ function renderTracks() {
     container.innerHTML = tracks.map((track, i) => `
         <div class="track-row flex items-center gap-3 p-3 rounded-lg cursor-pointer ${i === currentTrackIndex ? 'playing' : ''}"
              onclick="playTrack(${i})" data-index="${i}">
-            <div class="w-12 h-12 rounded-lg ${i === currentTrackIndex && isPlaying ? 'playing-indicator' : ''} bg-surface-2 flex items-center justify-center flex-shrink-0 relative">
-                <span class="material-icons-outlined ${i === currentTrackIndex && isPlaying ? 'text-primary' : 'text-gray-500'} text-xl">
-                    ${i === currentTrackIndex && isPlaying ? 'graphic_eq' : 'music_note'}
-                </span>
+            <div class="w-12 h-12 rounded-lg ${i === currentTrackIndex && isPlaying ? 'playing-indicator' : ''} bg-surface-2 flex items-center justify-center flex-shrink-0 relative overflow-hidden">
+                ${track.coverUrl
+                    ? `<img src="${track.coverUrl}" class="w-full h-full object-cover" alt="">`
+                    : `<span class="material-icons-outlined ${i === currentTrackIndex && isPlaying ? 'text-primary' : 'text-gray-500'} text-xl">
+                        ${i === currentTrackIndex && isPlaying ? 'graphic_eq' : 'music_note'}
+                    </span>`}
                 ${track.duration ? `<span class="absolute bottom-0.5 right-0.5 text-[8px] text-gray-400 bg-black/60 px-1 rounded">${formatTime(track.duration)}</span>` : ''}
             </div>
             <div class="flex-1 min-w-0">
@@ -706,10 +746,42 @@ function renderTracks() {
                 </div>
                 <p class="text-xs text-gray-500 truncate mt-0.5">${track.prompt}</p>
             </div>
-            <div class="flex items-center gap-1">
-                <button onclick="event.stopPropagation(); downloadTrack(${i})" class="p-1.5 rounded hover:bg-surface-3 text-gray-400 hover:text-white transition-colors" title="Download">
+            <div class="flex items-center gap-0.5 flex-shrink-0">
+                ${track.lyrics ? `<button onclick="event.stopPropagation(); showLyricsModal(${i})" class="p-1.5 rounded hover:bg-surface-3 text-gray-400 hover:text-white transition-colors" title="View lyrics">
+                    <span class="material-icons-outlined text-sm">lyrics</span>
+                </button>` : ''}
+                <button onclick="event.stopPropagation(); generateCover(${i})" class="p-1.5 rounded hover:bg-surface-3 text-gray-400 hover:text-white transition-colors" title="${track.coverUrl ? 'Regenerate cover art' : 'Generate cover art'}">
+                    <span class="material-icons-outlined text-sm">${track.coverUrl ? 'auto_awesome' : 'palette'}</span>
+                </button>
+                ${track.coverUrl ? `<button onclick="event.stopPropagation(); upscaleCover(${i})" class="p-1.5 rounded hover:bg-surface-3 text-gray-400 hover:text-white transition-colors" title="Upscale cover to 3000×3000 (Bandcamp-quality)">
+                    <span class="material-icons-outlined text-sm">high_quality</span>
+                </button>` : ''}
+                <button onclick="event.stopPropagation(); renameTrack(${i})" class="p-1.5 rounded hover:bg-surface-3 text-gray-400 hover:text-white transition-colors" title="Rename track">
+                    <span class="material-icons-outlined text-sm">edit</span>
+                </button>
+                <button onclick="event.stopPropagation(); downloadTrack(${i}, 'mp3')" class="p-1.5 rounded hover:bg-surface-3 text-gray-400 hover:text-white transition-colors" title="Download MP3">
                     <span class="material-icons-outlined text-sm">download</span>
                 </button>
+                <button onclick="event.stopPropagation(); toggleFormatMenu(${i}, this)" class="p-1 rounded-r hover:bg-surface-3 text-gray-400 hover:text-white transition-colors" title="Download in other format">
+                    <span class="material-icons-outlined text-xs">arrow_drop_down</span>
+                </button>
+                <div id="formatMenu_${i}" class="hidden absolute z-50 mt-1 bg-surface border border-gray-700 rounded-lg shadow-xl py-1 min-w-[140px]" style="right: 0;">
+                    <button onclick="event.stopPropagation(); downloadTrack(${i}, 'mp3'); hideFormatMenu(${i})" class="w-full text-left px-3 py-1.5 text-xs text-gray-300 hover:bg-surface-3 flex items-center gap-2">
+                        <span class="material-icons-outlined text-xs">music_note</span> MP3
+                    </button>
+                    <button onclick="event.stopPropagation(); downloadTrack(${i}, 'flac'); hideFormatMenu(${i})" class="w-full text-left px-3 py-1.5 text-xs text-gray-300 hover:bg-surface-3 flex items-center gap-2">
+                        <span class="material-icons-outlined text-xs">audio_file</span> FLAC
+                    </button>
+                    <button onclick="event.stopPropagation(); downloadTrack(${i}, 'wav'); hideFormatMenu(${i})" class="w-full text-left px-3 py-1.5 text-xs text-gray-300 hover:bg-surface-3 flex items-center gap-2">
+                        <span class="material-icons-outlined text-xs">graphic_eq</span> WAV
+                    </button>
+                    <div class="border-t border-gray-700 my-1"></div>
+                    ${track.coverUrl ? `<button onclick="event.stopPropagation(); downloadTrack(${i}, 'cover'); hideFormatMenu(${i})" class="w-full text-left px-3 py-1.5 text-xs text-gray-300 hover:bg-surface-3 flex items-center gap-2">
+                        <span class="material-icons-outlined text-xs">image</span> Cover art (JPG)
+                    </button>` : `<button disabled class="w-full text-left px-3 py-1.5 text-xs text-gray-600 flex items-center gap-2 cursor-not-allowed" title="Generate cover art first">
+                        <span class="material-icons-outlined text-xs">image</span> Cover art (JPG)
+                    </button>`}
+                </div>
                 <button onclick="event.stopPropagation(); deleteTrack(${i})" class="p-1.5 rounded hover:bg-surface-3 text-gray-400 hover:text-red-400 transition-colors" title="Delete">
                     <span class="material-icons-outlined text-sm">delete</span>
                 </button>
@@ -835,13 +907,231 @@ function toggleRepeat() {
 // ============================================================
 // Actions
 // ============================================================
-function downloadTrack(index) {
+function downloadTrack(index, format = 'mp3') {
     const track = tracks[index];
     if (!track) return;
+    const safeTitle = (track.title || 'track').replace(/[^a-zA-Z0-9 ]/g, '');
+
+    // Cover art is a special case — it has its own URL, no ?format= param, JPG extension.
+    if (format === 'cover') {
+        if (!track.coverUrl) {
+            alert('No cover art yet. Click the palette icon to generate one first.');
+            return;
+        }
+        const a = document.createElement('a');
+        // Strip the cache-buster query param from the cover URL for the download href
+        a.href = track.coverUrl.split('?')[0];
+        a.download = `${safeTitle}_cover.jpg`;
+        a.click();
+        return;
+    }
+
     const a = document.createElement('a');
-    a.href = track.url;
-    a.download = `${track.title.replace(/[^a-zA-Z0-9 ]/g, '')}.mp3`;
+    // For freshly-generated tracks (blob URL), only MP3 is available locally.
+    // For tracks loaded from /tracks (cloudId), append ?format= so server transcodes.
+    if (track.blob || track.url.startsWith('blob:')) {
+        if (format !== 'mp3') {
+            alert(`${format.toUpperCase()} download is only available for saved tracks. Hit refresh first, then try again.`);
+            return;
+        }
+        a.href = track.url;
+    } else {
+        a.href = `${track.url}?format=${format}`;
+    }
+    a.download = `${safeTitle}.${format}`;
     a.click();
+}
+
+function toggleFormatMenu(index, btnEl) {
+    // Close any other open menu first
+    document.querySelectorAll('[id^="formatMenu_"]').forEach(el => {
+        if (el.id !== `formatMenu_${index}`) el.classList.add('hidden');
+    });
+    const menu = document.getElementById(`formatMenu_${index}`);
+    if (!menu) return;
+    menu.classList.toggle('hidden');
+    // Position the menu relative to the button so it doesn't go off-screen
+    const rect = btnEl.getBoundingClientRect();
+    menu.style.top = `${rect.bottom + 4}px`;
+    menu.style.right = `${window.innerWidth - rect.right}px`;
+    menu.style.left = 'auto';
+}
+
+function hideFormatMenu(index) {
+    const menu = document.getElementById(`formatMenu_${index}`);
+    if (menu) menu.classList.add('hidden');
+}
+
+// Close any open format menu when clicking elsewhere
+document.addEventListener('click', (e) => {
+    if (!e.target.closest('[id^="formatMenu_"]') && !e.target.closest('[onclick*="toggleFormatMenu"]')) {
+        document.querySelectorAll('[id^="formatMenu_"]').forEach(el => el.classList.add('hidden'));
+    }
+});
+
+// ============================================================
+// Lyrics modal
+// ============================================================
+let currentLyricsText = '';
+
+function showLyricsModal(index) {
+    const track = tracks[index];
+    if (!track || !track.lyrics) return;
+    currentLyricsText = track.lyrics;
+    document.getElementById('lyricsModalTitle').textContent = track.title || 'Lyrics';
+    document.getElementById('lyricsModalContent').textContent = track.lyrics;
+    document.getElementById('lyricsModal').classList.remove('hidden');
+}
+
+function closeLyricsModal() {
+    document.getElementById('lyricsModal').classList.add('hidden');
+    currentLyricsText = '';
+}
+
+async function copyLyrics() {
+    if (!currentLyricsText) return;
+    try {
+        await navigator.clipboard.writeText(currentLyricsText);
+        // Brief visual feedback: flash the copy icon
+        const btn = event.target.closest('button');
+        const icon = btn.querySelector('.material-icons-outlined');
+        const orig = icon.textContent;
+        icon.textContent = 'check';
+        setTimeout(() => { icon.textContent = orig; }, 1200);
+    } catch(e) {
+        console.warn('Clipboard write failed:', e);
+        alert('Could not copy. Select and copy manually.');
+    }
+}
+
+// ESC closes the lyrics modal
+document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') closeLyricsModal();
+});
+
+// ============================================================
+// Cover art generation
+// ============================================================
+async function generateCover(index) {
+    const track = tracks[index];
+    if (!track || !track.id) {
+        alert('Track must be saved before generating cover art. Hit refresh, then try again.');
+        return;
+    }
+    if (!confirm(`Generate cover art for "${track.title}"?\n\nThis calls the MiniMax image API and may take 15-30 seconds.`)) return;
+
+    // Visual feedback: temporarily swap the icon to a spinner
+    const btn = event.target.closest('button');
+    const icon = btn.querySelector('.material-icons-outlined');
+    const orig = icon.textContent;
+    icon.textContent = 'progress_activity';
+    icon.classList.add('animate-spin');
+    btn.disabled = true;
+
+    try {
+        const resp = await fetch(`/tracks/${encodeURIComponent(track.id)}/cover`, { method: 'POST' });
+        if (!resp.ok) {
+            const err = await resp.json().catch(() => ({}));
+            throw new Error(err.error || 'Cover generation failed');
+        }
+        const data = await resp.json();
+        track.coverUrl = data.cover_url + '?t=' + Date.now();  // cache buster
+        renderTracks();
+    } catch(e) {
+        console.error('Cover gen error:', e);
+        alert('Cover generation failed: ' + e.message);
+    } finally {
+        icon.textContent = orig;
+        icon.classList.remove('animate-spin');
+        btn.disabled = false;
+    }
+}
+
+// ============================================================
+// Cover art upscaling (1024 -> 3000 for Bandcamp)
+// ============================================================
+async function upscaleCover(index) {
+    const track = tracks[index];
+    if (!track || !track.id || !track.coverUrl) return;
+
+    if (!confirm(`Upscale "${track.title}" cover art to 3000×3000?\n\nThis overwrites the existing cover file. The original is not preserved.`)) return;
+
+    const btn = event.target.closest('button');
+    const icon = btn.querySelector('.material-icons-outlined');
+    const orig = icon.textContent;
+    icon.textContent = 'progress_activity';
+    icon.classList.add('animate-spin');
+    btn.disabled = true;
+
+    try {
+        const resp = await fetch(`/tracks/${encodeURIComponent(track.id)}/cover/upscale`, { method: 'POST' });
+        if (!resp.ok) {
+            const err = await resp.json().catch(() => ({}));
+            throw new Error(err.error || 'Upscale failed');
+        }
+        const data = await resp.json();
+        const dim = data.dimensions ? `${data.dimensions[0]}×${data.dimensions[1]}` : 'done';
+        const mb = (data.size_bytes / (1024 * 1024)).toFixed(1);
+        if (data.upscaled === false) {
+            alert(`Cover already at ${dim} (${mb} MB) — no change made.`);
+        } else {
+            alert(`Cover upscaled to ${dim} (${mb} MB).`);
+        }
+        // Refresh the thumbnail (cache buster so browser refetches)
+        track.coverUrl = data.cover_url + '?t=' + Date.now();
+        renderTracks();
+    } catch(e) {
+        console.error('Upscale error:', e);
+        alert('Upscale failed: ' + e.message);
+    } finally {
+        icon.textContent = orig;
+        icon.classList.remove('animate-spin');
+        btn.disabled = false;
+    }
+}
+
+// ============================================================
+// Rename a track (metadata-only, doesn't touch files on disk)
+// ============================================================
+async function renameTrack(index) {
+    const track = tracks[index];
+    if (!track || !track.id) {
+        alert('Track must be saved before renaming. Hit refresh, then try again.');
+        return;
+    }
+    const newTitle = prompt(`Rename track:`, track.title || '');
+    if (newTitle === null) return;  // cancelled
+    const cleaned = newTitle.trim();
+    if (!cleaned) {
+        alert('Title cannot be empty.');
+        return;
+    }
+    if (cleaned === track.title) return;  // no change
+    if (cleaned.length > 200) {
+        alert('Title too long (max 200 chars).');
+        return;
+    }
+
+    try {
+        const resp = await fetch(`/tracks/${encodeURIComponent(track.id)}/rename`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ title: cleaned }),
+        });
+        if (!resp.ok) {
+            const err = await resp.json().catch(() => ({}));
+            throw new Error(err.error || 'Rename failed');
+        }
+        track.title = cleaned;
+        // Update the player bar if this track is currently playing
+        if (currentTrackIndex === index) {
+            document.getElementById('playerTitle').textContent = cleaned;
+        }
+        renderTracks();
+    } catch(e) {
+        console.error('Rename error:', e);
+        alert('Rename failed: ' + e.message);
+    }
 }
 
 async function deleteTrack(index) {

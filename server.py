@@ -8,6 +8,8 @@ import json
 import time
 import uuid
 import base64
+import subprocess
+import tempfile
 
 # MiniMax config — set MINIMAX_API_KEY in your environment or a .env loader.
 MINIMAX_API_KEY = os.environ.get("MINIMAX_API_KEY", "")
@@ -38,7 +40,7 @@ def _save_tracks(data):
     with open(TRACKS_FILE, "w") as f:
         json.dump(data, f, indent=2)
 
-def _create_track_record(title, prompt, model, duration_ms, filename):
+def _create_track_record(title, prompt, model, duration_ms, filename, lyrics="", cover_filename=""):
     """Create a track record in tracks.json."""
     track_id = f"audioforge_{int(time.time())}_{uuid.uuid4().hex[:8]}"
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -50,26 +52,53 @@ def _create_track_record(title, prompt, model, duration_ms, filename):
         "model": model,
         "created_at": now,
         "duration": duration_ms / 1000.0 if duration_ms else 0,
+        "lyrics": lyrics,
+        "cover_filename": cover_filename,
     }
     tracks_data = _load_tracks()
     tracks_data["tracks"].insert(0, track)
     _save_tracks(tracks_data)
     return track_id
 
+
 FRONTEND_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _clean_lyrics_for_storage(lyrics):
+    """Strip pure-placeholder lyrics so we don't store '(Instrumental)' or '[Intro]' alone.
+    Returns the cleaned lyrics, or '' if there's nothing meaningful."""
+    if not lyrics:
+        return ""
+    import re
+    # Drop structure tags, then check if any text remains.
+    text_only = re.sub(r"\[[^\]]*\]", "", lyrics)
+    text_only = re.sub(r"\(Instrumental\)", "", text_only, flags=re.IGNORECASE)
+    text_only = text_only.strip()
+    if not text_only:
+        return ""
+    return lyrics.strip()
+
 
 class ProxyHandler(http.server.SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=FRONTEND_DIR, **kwargs)
 
     def do_GET(self):
-        if self.path == "/tracks":
+        # Strip query string for routing — we handle format=? in the track handler
+        path_only = self.path.split("?", 1)[0]
+        if path_only == "/tracks":
             self.serve_tracks_list()
-        elif self.path.startswith("/tracks/") and not self.path.endswith("/metadata"):
-            # /tracks/{id} — serve audio file
-            track_id = self.path[len("/tracks/"):]
+        elif path_only.startswith("/tracks/") and path_only.endswith("/cover"):
+            # /tracks/{id}/cover — serve cover image
+            inner = path_only[len("/tracks/"):-len("/cover")].rstrip("/")
+            self.handle_cover_serve(inner)
+        elif path_only.startswith("/tracks/") and not path_only.endswith("/metadata"):
+            # /tracks/{id}[?format=flac] — serve audio file
+            track_id = path_only[len("/tracks/"):]
             self.handle_track_download(track_id)
         else:
+            # Path has a query string SimpleHTTPRequestHandler can't handle — serve without it
+            self.path = path_only
             super().do_GET()
 
     def do_POST(self):
@@ -77,6 +106,18 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
             self.handle_music_generate()
         elif self.path == "/music/lyrics":
             self.handle_lyrics_generate()
+        elif self.path.startswith("/tracks/") and self.path.endswith("/cover/upscale"):
+            # /tracks/{id}/cover/upscale — upscale existing cover to 3000x3000
+            inner = self.path[len("/tracks/"):-len("/cover/upscale")].rstrip("/")
+            self.handle_cover_upscale(inner)
+        elif self.path.startswith("/tracks/") and self.path.endswith("/cover"):
+            # /tracks/{id}/cover — generate cover art
+            inner = self.path[len("/tracks/"):-len("/cover")].rstrip("/")
+            self.handle_cover_generate(inner)
+        elif self.path.startswith("/tracks/") and self.path.endswith("/rename"):
+            # /tracks/{id}/rename — rename a track
+            inner = self.path[len("/tracks/"):-len("/rename")].rstrip("/")
+            self.handle_track_rename(inner)
         elif self.path.endswith("/metadata"):
             # /tracks/{id}/metadata — just register metadata (fallback)
             self.handle_track_metadata()
@@ -177,8 +218,10 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
             with open(filepath, "wb") as f:
                 f.write(audio_bytes)
 
-            # Register track
-            track_id = _create_track_record(title, prompt, model, duration_ms, filename)
+            # Register track — include lyrics so they can be embedded in Bandcamp metadata.
+            # Don't store placeholder strings like "[Instrumental]" or empty structure tags.
+            cleaned_lyrics = _clean_lyrics_for_storage(lyrics) if lyrics else ""
+            track_id = _create_track_record(title, prompt, model, duration_ms, filename, lyrics=cleaned_lyrics)
 
             self.send_response(200)
             self.send_header("Content-Type", "audio/mpeg")
@@ -347,12 +390,54 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
             tracks_data = _load_tracks()
             for t in tracks_data.get("tracks", []):
                 if t.get("id") == track_id:
-                    t.update({k: v for k, v in body.items() if v})
+                    # Only update keys that were provided with non-empty values.
+                    t.update({k: v for k, v in body.items() if v not in (None, "")})
+                    # Special-case lyrics: allow empty string to clear it
+                    if "lyrics" in body:
+                        t["lyrics"] = body["lyrics"]
                     _save_tracks(tracks_data)
                     self.send_json_ok({"id": track_id})
                     return
 
             self.send_json_error(404, "Track not found")
+        except Exception as e:
+            self.send_json_error(500, str(e))
+
+    # ================================================================
+    # Rename a track. Purely a metadata change — filename on disk stays
+    # keyed by track_id so cover/MP3 stay paired.
+    # ================================================================
+    def handle_track_rename(self, track_id):
+        try:
+            content_len = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(content_len))
+            new_title = (body.get("title") or "").strip()
+
+            if not new_title:
+                self.send_json_error(400, "Title cannot be empty")
+                return
+            if len(new_title) > 200:
+                self.send_json_error(400, "Title too long (max 200 chars)")
+                return
+
+            tracks_data = _load_tracks()
+            for t in tracks_data.get("tracks", []):
+                if t.get("id") == track_id:
+                    old_title = t.get("title", "")
+                    t["title"] = new_title
+                    t["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                    _save_tracks(tracks_data)
+                    self.send_json_ok({
+                        "id": track_id,
+                        "old_title": old_title,
+                        "new_title": new_title,
+                    })
+                    self.log_message("Renamed %s: '%s' -> '%s'", track_id, old_title[:30], new_title[:30])
+                    return
+
+            self.send_json_error(404, "Track not found")
+        except json.JSONDecodeError:
+            self.send_json_error(400, "Invalid JSON")
         except Exception as e:
             self.send_json_error(500, str(e))
 
@@ -366,6 +451,9 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
             for t in tracks_data.get("tracks", []):
                 filepath = os.path.join(MEDIA_DIR, t.get("filename", ""))
                 exists = os.path.exists(filepath)
+                cover_filename = t.get("cover_filename", "")
+                cover_filepath = os.path.join(MEDIA_DIR, cover_filename) if cover_filename else ""
+                has_cover = bool(cover_filename) and os.path.exists(cover_filepath)
                 tracks.append({
                     "id": t.get("id", ""),
                     "title": t.get("title", "Untitled"),
@@ -374,6 +462,9 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
                     "created_at": t.get("created_at", ""),
                     "duration": t.get("duration", 0),
                     "exists": exists,
+                    "lyrics": t.get("lyrics", ""),
+                    "has_cover": has_cover,
+                    "cover_url": f"/tracks/{t.get('id', '')}/cover" if has_cover else None,
                 })
             self.send_json_ok({"tracks": tracks})
         except Exception as e:
@@ -381,10 +472,227 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
             self.send_json_ok({"tracks": [], "error": str(e)})
 
     # ================================================================
+    # Cover art: GET serves existing image, POST generates a new one
+    # POST /cover/upscale resizes to 3000x3000 for Bandcamp-quality masters
+    # ================================================================
+    def handle_cover_serve(self, track_id):
+        """Serve a track's cover image. 404 if none."""
+        tracks_data = _load_tracks()
+        track = None
+        for t in tracks_data.get("tracks", []):
+            if t.get("id") == track_id:
+                track = t
+                break
+        if not track:
+            self.send_error(404)
+            return
+        cover_filename = track.get("cover_filename", "")
+        if not cover_filename:
+            self.send_error(404)
+            return
+        cover_path = os.path.join(MEDIA_DIR, cover_filename)
+        if not os.path.exists(cover_path):
+            self.send_error(404)
+            return
+        with open(cover_path, "rb") as f:
+            data = f.read()
+        self.send_response(200)
+        self.send_header("Content-Type", "image/jpeg")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "public, max-age=86400")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def handle_cover_upscale(self, track_id):
+        """Upscale a track's cover to 3000x3000 using Pillow (LANCZOS resample).
+        Overwrites the existing JPG in place. Idempotent — running twice is fine."""
+        try:
+            tracks_data = _load_tracks()
+            track = None
+            for t in tracks_data.get("tracks", []):
+                if t.get("id") == track_id:
+                    track = t
+                    break
+            if not track:
+                self.send_json_error(404, "Track not found")
+                return
+
+            cover_filename = track.get("cover_filename", "")
+            if not cover_filename:
+                self.send_json_error(404, "No cover art — generate one first")
+                return
+
+            cover_path = os.path.join(MEDIA_DIR, cover_filename)
+            if not os.path.exists(cover_path):
+                self.send_json_error(404, "Cover file missing on disk")
+                return
+
+            # Use Pillow for high-quality upscaling. LANCZOS is the best general
+            # downscaling/upscaling filter — sharper than bilinear, less ringing than bicubic.
+            from PIL import Image
+            try:
+                with Image.open(cover_path) as img:
+                    # Skip work if already large enough
+                    if img.size[0] >= 3000 and img.size[1] >= 3000:
+                        self.send_json_ok({
+                            "track_id": track_id,
+                            "cover_url": f"/tracks/{track_id}/cover",
+                            "size_bytes": os.path.getsize(cover_path),
+                            "dimensions": list(img.size),
+                            "upscaled": False,
+                            "message": "Already at or above 3000px",
+                        })
+                        return
+
+                    # Convert palette/RGBA to RGB before saving as JPEG (JPEG has no alpha)
+                    if img.mode in ("RGBA", "LA", "P"):
+                        # For palette images with transparency, composite onto black
+                        if img.mode == "P" and "transparency" in img.info:
+                            img = img.convert("RGBA")
+                        if img.mode in ("RGBA", "LA"):
+                            bg = Image.new("RGB", img.size, (0, 0, 0))
+                            bg.paste(img, mask=img.split()[-1])
+                            img = bg
+                        else:
+                            img = img.convert("RGB")
+
+                    upscaled = img.resize((3000, 3000), Image.LANCZOS)
+                    # Quality 95 — perceptually transparent for cover art, keeps file size sane
+                    upscaled.save(cover_path, "JPEG", quality=95, optimize=True)
+
+                    new_size = os.path.getsize(cover_path)
+                    self.send_json_ok({
+                        "track_id": track_id,
+                        "cover_url": f"/tracks/{track_id}/cover",
+                        "size_bytes": new_size,
+                        "dimensions": [3000, 3000],
+                        "upscaled": True,
+                    })
+                    self.log_message("Upscaled cover for %s: %d bytes", track_id, new_size)
+
+            except Exception as e:
+                self.log_message("Pillow upscale failed for %s: %s", track_id, e)
+                self.send_json_error(500, f"Upscale failed: {e}")
+
+        except Exception as e:
+            self.log_message("Cover upscale error: %s", str(e))
+            self.send_json_error(500, str(e))
+
+    def handle_cover_generate(self, track_id):
+        """Generate cover art for an existing track via MiniMax image API.
+        Saves a 1:1 JPG alongside the track. Updates the track record."""
+        try:
+            tracks_data = _load_tracks()
+            track = None
+            for t in tracks_data.get("tracks", []):
+                if t.get("id") == track_id:
+                    track = t
+                    break
+            if not track:
+                self.send_json_error(404, "Track not found")
+                return
+
+            # Build a cover prompt from title + style. Keep it tight — image models
+            # do better with focused, evocative descriptions than tag dumps.
+            title = track.get("title", "Untitled")
+            prompt = track.get("prompt", "")
+            image_prompt = self._build_cover_prompt(title, prompt)
+
+            payload = {
+                "model": "image-01",
+                "prompt": image_prompt,
+                "aspect_ratio": "1:1",
+                "response_format": "base64",
+            }
+
+            req = urllib.request.Request(
+                "https://api.minimax.io/v1/image_generation",
+                data=json.dumps(payload).encode(),
+                method="POST",
+            )
+            req.add_header("Content-Type", "application/json")
+            req.add_header("Authorization", f"Bearer {MINIMAX_API_KEY}")
+
+            self.log_message("MiniMax image: track=%s prompt='%s'...", track_id, image_prompt[:80])
+
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                result = json.loads(resp.read())
+
+            base_resp = result.get("base_resp", {})
+            if base_resp.get("status_code") != 0:
+                self.send_json_error(500, f"MiniMax image error: {base_resp.get('status_msg', 'Unknown')}")
+                return
+
+            images = (result.get("data") or {}).get("image_base64", [])
+            if not images:
+                self.send_json_error(500, "No image returned from MiniMax")
+                return
+
+            # Decode and save. Reuse the track's ID for filename so cover/mp3 stay paired.
+            cover_filename = f"{track_id}_cover.jpg"
+            cover_path = os.path.join(MEDIA_DIR, cover_filename)
+            image_bytes = base64.b64decode(images[0])
+            with open(cover_path, "wb") as f:
+                f.write(image_bytes)
+
+            # Update track record
+            for t in tracks_data.get("tracks", []):
+                if t.get("id") == track_id:
+                    t["cover_filename"] = cover_filename
+                    t["cover_generated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                    break
+            _save_tracks(tracks_data)
+
+            self.send_json_ok({
+                "track_id": track_id,
+                "cover_url": f"/tracks/{track_id}/cover",
+                "size_bytes": len(image_bytes),
+            })
+            self.log_message("Generated cover for %s: %d bytes", track_id, len(image_bytes))
+
+        except urllib.error.HTTPError as e:
+            err_body = e.read().decode() if e.fp else ""
+            self.log_message("MiniMax image HTTP %d: %s", e.code, err_body[:300])
+            self.send_json_error(e.code, f"Image API error: {err_body[:300]}")
+        except Exception as e:
+            self.log_message("Cover gen error: %s", str(e))
+            self.send_json_error(500, str(e))
+
+    @staticmethod
+    def _build_cover_prompt(title, style):
+        """Compose a tight image prompt from the track's metadata.
+        Keep it under ~250 chars — image models lose focus past that."""
+        import re
+        # Pull a few evocative words from the style string; strip structural noise
+        style_words = re.sub(r"\b(bpm|tempo|male vocals|female vocals|vocal[s]?)\b", "", style, flags=re.IGNORECASE)
+        style_words = re.split(r"[,\s]+", style_words)
+        style_words = [w.strip() for w in style_words if 2 < len(w.strip()) < 18][:6]
+
+        style_phrase = ", ".join(style_words) if style_words else "music"
+        return (
+            f"Album cover art for a song titled '{title}'. "
+            f"Style: {style_phrase}. "
+            f"Centered composition, no text, no logos, no people in the foreground. "
+            f"Cinematic, moody, suitable as a square album cover."
+        )[:300]
+
+    # ================================================================
     # Local storage: download audio
+    # Supports ?format=flac to transcode on-the-fly via ffmpeg.
+    # Default (no param or ?format=mp3) returns the raw MP3 file unchanged.
     # ================================================================
     def handle_track_download(self, track_id):
         try:
+            # Parse ?format= query param. Anything other than 'flac' falls back to MP3.
+            fmt = "mp3"
+            if "?" in self.path:
+                from urllib.parse import parse_qs
+                qs = parse_qs(self.path.split("?", 1)[1])
+                requested = (qs.get("format", ["mp3"])[0] or "mp3").lower()
+                if requested in ("flac", "wav"):
+                    fmt = requested
+
             tracks_data = _load_tracks()
             track = None
             for t in tracks_data.get("tracks", []):
@@ -401,19 +709,78 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
                 self.send_error(404)
                 return
 
-            with open(filepath, "rb") as f:
-                data = f.read()
+            if fmt == "mp3":
+                # Fast path: stream the raw MP3 bytes as before.
+                with open(filepath, "rb") as f:
+                    data = f.read()
+                self.send_response(200)
+                self.send_header("Content-Type", "audio/mpeg")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Content-Length", len(data))
+                self.send_header("Content-Disposition", f'attachment; filename="{self._safe_download_name(track.get("title", "track"), "mp3")}"')
+                self.end_headers()
+                self.wfile.write(data)
+                self.log_message("Served MP3: %s (%d bytes)", track_id, len(data))
+                return
 
-            self.send_response(200)
-            self.send_header("Content-Type", "audio/mpeg")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Content-Length", len(data))
-            self.end_headers()
-            self.wfile.write(data)
+            # FLAC / WAV path: transcode with ffmpeg, stream stdout to client.
+            # Use a temp output file so we can set Content-Length accurately
+            # and avoid chunked encoding surprises across browsers.
+            ext = fmt  # 'flac' or 'wav'
+            tmp_fd, tmp_path = tempfile.mkstemp(suffix=f".{ext}", dir=MEDIA_DIR)
+            os.close(tmp_fd)
+            try:
+                cmd = [
+                    "ffmpeg", "-y", "-loglevel", "error",
+                    "-i", filepath,
+                    "-ar", "44100",
+                    "-ac", "2",
+                ]
+                if ext == "flac":
+                    cmd += ["-c:a", "flac", "-compression_level", "8"]
+                else:  # wav
+                    cmd += ["-c:a", "pcm_s16le"]
+                cmd.append(tmp_path)
 
+                proc = subprocess.run(cmd, capture_output=True, timeout=120)
+                if proc.returncode != 0:
+                    self.log_message("ffmpeg failed (rc=%d): %s", proc.returncode, proc.stderr.decode()[:500])
+                    self.send_json_error(500, f"Transcode to {ext.upper()} failed")
+                    return
+
+                with open(tmp_path, "rb") as f:
+                    data = f.read()
+
+                content_type = "audio/flac" if ext == "flac" else "audio/wav"
+                self.send_response(200)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Content-Length", len(data))
+                self.send_header("Content-Disposition", f'attachment; filename="{self._safe_download_name(track.get("title", "track"), ext)}"')
+                self.end_headers()
+                self.wfile.write(data)
+                self.log_message("Served %s: %s (%d bytes, transcoded from MP3)", ext.upper(), track_id, len(data))
+            finally:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+
+        except subprocess.TimeoutExpired:
+            self.log_message("ffmpeg timeout transcoding %s", track_id)
+            self.send_json_error(504, "Transcode timeout")
+        except FileNotFoundError:
+            self.log_message("ffmpeg not found — install ffmpeg to use FLAC downloads")
+            self.send_json_error(500, "ffmpeg not installed on server")
         except Exception as e:
             self.log_message("Track download error: %s", str(e))
             self.send_error(500)
+
+    @staticmethod
+    def _safe_download_name(title, ext):
+        """Make a filename safe for Content-Disposition."""
+        safe = "".join(c for c in title if c.isalnum() or c in " -_").strip()
+        if not safe:
+            safe = "track"
+        return f"{safe}.{ext}"
 
     # ================================================================
     # Local storage: delete
@@ -431,9 +798,17 @@ class ProxyHandler(http.server.SimpleHTTPRequestHandler):
                 self.send_json_error(404, "Track not found")
                 return
 
+            # Remove MP3
             filepath = os.path.join(MEDIA_DIR, track.get("filename", ""))
-            if os.path.exists(filepath):
+            if filepath and os.path.exists(filepath):
                 os.remove(filepath)
+
+            # Remove cover art if present
+            cover_filename = track.get("cover_filename", "")
+            if cover_filename:
+                cover_path = os.path.join(MEDIA_DIR, cover_filename)
+                if os.path.exists(cover_path):
+                    os.remove(cover_path)
 
             tracks_data["tracks"] = [t for t in tracks_data["tracks"] if t.get("id") != track_id]
             _save_tracks(tracks_data)
